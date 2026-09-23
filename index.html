@@ -345,7 +345,7 @@ const bracketOf=p=>BRACKETS.find(b=>p>=b.min&&p<b.max)||BRACKETS[3];
 
 const S={
   master:[], lines:[], shelfDone:{}, users:[], ccHistory:[],
-  cfg:{minLifePct:50, job:"", author:"Arvind Kumar", site:"", ccComplete:false, ccId:"", ccStatus:"OPEN", ccStartedAt:"", ccClosedAt:"", ccClosedBy:"", ccSeq:0, deletedShelves:{},shelfLocks:{}},
+  cfg:{minLifePct:50, job:"", author:"Arvind Kumar", site:"", taskId:"", taskStatus:"EMPTY", taskStartedAt:"", taskCompletedAt:"", previousTaskId:"", deletedShelves:{},shelfLocks:{}},
   cloud:{url:"", key:"", auto:true, lastPush:"", lastPull:"", err:""},
   me:null, view:"dash", activeShelf:null, editId:null,
   filter:"all", q:"", bkFilter:"all", searchQ:"",
@@ -572,7 +572,7 @@ async function boot(){
     }catch(e){}
   }
   if(meId) S.me=S.users.find(u=>u.id===meId)||null;
-  ensureCc(); S.booted=true; render();
+  ensureTask(); S.booted=true; render();
 }
 
 async function hash(pw){
@@ -741,69 +741,50 @@ function noData(msg){
     el("button",{class:"btn hv",onclick(){S.view="setup";render()}},"Go to upload"));
 }
 
-/*────── CYCLE CONTROL ──────*/
+/*────── AUDIT TASK CONTROL ──────*/
 function activeShelves(){return allShelves()}
-function makeCcId(){
+function makeTaskId(){
   const d=new Date(), ds=d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");
-  const n=(Number(S.cfg.ccSeq||0)+1); S.cfg.ccSeq=n;
-  return "CC-"+ds+"-"+String(n).padStart(3,"0");
+  const ts=String(d.getHours()).padStart(2,"0")+String(d.getMinutes()).padStart(2,"0")+String(d.getSeconds()).padStart(2,"0");
+  return "TASK-"+ds+"-"+ts;
 }
-function ensureCc(){
-  if(!S.cfg.ccId){
-    S.cfg.ccId=makeCcId(); S.cfg.ccStatus="OPEN"; S.cfg.ccComplete=false;
-    S.cfg.ccStartedAt=new Date().toISOString(); S.cfg.ccClosedAt="";
-    S.lines.forEach(l=>{if(!l.ccId)l.ccId=S.cfg.ccId});
+function ensureTask(){
+  if(!S.cfg.taskId){
+    S.cfg.taskId=makeTaskId(); S.cfg.taskStartedAt=new Date().toISOString();
+    S.cfg.taskStatus=S.master.length?"OPEN":"EMPTY"; S.cfg.taskCompletedAt="";
     save("state");
-  }else{
-    S.lines.forEach(l=>{if(!l.ccId)l.ccId=S.cfg.ccId});
   }
 }
-function ccReady(){const t=totals(); return t.shelves>0 && t.stats.every(s=>s.state==="done")}
-function archiveCurrentCc(){
-  const id=S.cfg.ccId||makeCcId(), idx=S.ccHistory.findIndex(x=>x.id===id);
-  const rec={id,job:S.cfg.job||"Stock Count",author:S.cfg.author||"",site:S.cfg.site||"",
-    startedAt:S.cfg.ccStartedAt||"",closedAt:new Date().toISOString(),closedBy:S.me?S.me.name:"",
-    master:JSON.parse(JSON.stringify(S.master)),lines:JSON.parse(JSON.stringify(S.lines)),
-    shelfDone:JSON.parse(JSON.stringify(S.shelfDone))};
-  if(idx>=0)S.ccHistory[idx]=rec;else S.ccHistory.push(rec);
-}
-function completeCycle(){
-  if(!S.me){toast("Sign in first","err");return}
-  if(!ccReady()){toast("Complete or delete every shelf before closing CC","err");return}
-  archiveCurrentCc(); S.cfg.ccComplete=true; S.cfg.ccStatus="CLOSED";
-  S.cfg.ccClosedAt=new Date().toISOString(); S.cfg.ccClosedBy=S.me.name; S.cfg.shelfLocks={};
-  save("state"); toast((S.cfg.ccId||"CC")+" closed. All shelf locks released.","good"); render();
-}
-function startNewCC(){
-  if(!S.me){toast("Sign in first","err");return}
-  if(!S.cfg.ccComplete){toast("Close the current CC first","err");return}
-  S.lines=[]; S.shelfDone={}; S.cfg.shelfLocks={}; S.cfg.deletedShelves={};
-  S.cfg.ccId=makeCcId(); S.cfg.ccStatus="OPEN"; S.cfg.ccComplete=false;
-  S.cfg.ccStartedAt=new Date().toISOString(); S.cfg.ccClosedAt=""; S.cfg.ccClosedBy="";
-  S.activeShelf=null;S.editId=null; save("lines","state");
-  toast(S.cfg.ccId+" created. All shelves are released.","good"); render();
-}
-function deleteShelf(shelf){
-  if(!S.me){toast("Sign in first","err");return}
-  if(S.cfg.ccComplete){toast("Current CC is already completed. Create a new CC first.","err");return}
-  const st=shelfStat(shelf);
-  if(st.done){toast("A completed shelf can't be deleted — reopen it first if you need to change it","err");return}
-  S.master=S.master.filter(r=>r.shelf!==shelf); S.lines=S.lines.filter(l=>l.shelf!==shelf);
-  delete S.shelfDone[shelf]; if(S.cfg.shelfLocks)delete S.cfg.shelfLocks[shelf];
-  S.cfg.deletedShelves=S.cfg.deletedShelves||{}; S.cfg.deletedShelves[shelf]=true;
-  if(S.activeShelf===shelf)S.activeShelf=null;
-  save("master","lines","state");toast("Shelf "+shelf+" deleted from current CC","good");render();
+function taskReady(){const t=totals(); return t.shelves>0 && t.stats.every(s=>s.state==="done")}
+function autoCompleteTask(){
+  if(!taskReady() || S.cfg.taskStatus==="COMPLETE")return false;
+  S.cfg.taskStatus="COMPLETE"; S.cfg.taskCompletedAt=new Date().toISOString();
+  S.cfg.shelfLocks={}; save("state");
+  return true;
 }
 function cycleControl(host,t){
-  ensureCc(); const ready=ccReady(), closed=!!S.cfg.ccComplete;
+  ensureTask();
+  const ready=taskReady(), complete=S.cfg.taskStatus==="COMPLETE";
   const bar=el("div",{class:"cycle-bar"},
-    el("div",{},el("span",{class:"state",text:closed?"✓ CC Closed":ready?"✓ All shelves completed":"Cycle Count in progress"}),
-      el("div",{class:"hint",text:(S.cfg.ccId||"CC")+" · "+(closed?"Closed — all shelf locks released":"Open for scanning")})),
+    el("div",{},el("span",{class:"state",text:complete?"✓ Task Completed":ready?"✓ All Bins Completed":"Audit Task in Progress"}),
+      el("div",{class:"hint",text:(S.cfg.taskId||"Task")+" · "+(S.cfg.taskStartedAt?tstamp(S.cfg.taskStartedAt):"—")+(complete&&S.cfg.taskCompletedAt?" · Completed "+tstamp(S.cfg.taskCompletedAt):"")})),
     el("div",{class:"compact-actions"},
-      closed?tapTwice("btn hv","Create New CC",startNewCC,{disabled:!isAdmin(),title:!isAdmin()?"Only an admin can start a new cycle (it resets the count)":""}):
-      tapTwice("btn ok","Close CC",completeCycle,{disabled:!ready,title:!ready?"Complete or delete every shelf first":""}),
-      !closed?el("button",{class:"btn ghost sm",onclick(){S.view="scan";S.filter="pending";render()}},"Open Pending Shelves"):null));
+      el("button",{class:"btn ghost sm",onclick(){S.view="setup";render()}},"Upload New Bins"),
+      !complete?el("button",{class:"btn ghost sm",onclick(){S.view="scan";S.filter="pending";render()}},"Open Pending Bins"):null));
   host.append(bar);
+}
+/* Legacy CC functions intentionally disabled. A new upload creates a new task. */
+function completeCycle(){toast("Task completion is automatic. Upload new bins to create the next task.","good")}
+function startNewCC(){toast("Upload new bins to create a new task.","good")}
+function deleteShelf(shelf){
+  if(!S.me){toast("Sign in first","err");return}
+  if(S.cfg.taskStatus==="COMPLETE"){toast("Task is already completed. Upload new bins to create a new task.","err");return}
+  const st=shelfStat(shelf);
+  if(st.done){toast("A completed bin can't be deleted — reopen it first if needed","err");return}
+  S.master=S.master.filter(r=>r.shelf!==shelf); S.lines=S.lines.filter(l=>l.shelf!==shelf);
+  delete S.shelfDone[shelf]; if(S.cfg.shelfLocks)delete S.cfg.shelfLocks[shelf];
+  if(S.activeShelf===shelf)S.activeShelf=null;
+  save("master","lines","state");toast("Bin "+shelf+" deleted from current task","good");render();
 }
 /*────── DASHBOARD ──────*/
 function vDash(host,t){
@@ -818,12 +799,10 @@ function vDash(host,t){
     el("div",{class:"welcome-badge",text:"Accurate Inventory · Stronger Operations"}));
   host.append(welcome);
   host.append(el("div",{class:"cycle-bar"},
-    el("div",{},el("span",{class:"state",text:S.cfg.ccComplete?"✓ Audit Completed":readyState(t)?"✓ Ready to Complete":"● Audit in Progress"}),
-      el("div",{class:"hint",text:S.cfg.ccComplete?"All data is locked":"Complete all shelves or delete unused shelves"})),
+    el("div",{},el("span",{class:"state",text:S.cfg.taskStatus==="COMPLETE"?"✓ Audit Completed":readyState(t)?"✓ All Bins Completed":"● Audit In Progress"}),
+      el("div",{class:"hint",text:S.cfg.taskStatus==="COMPLETE"?"All bins are completed":"New task is created only when a new bin list is uploaded"})),
     el("div",{class:"compact-actions"},
-      el("button",{class:"btn hv",onclick(){S.view="setup";render()}},"Download / Upload"),
-      tapTwice("btn ok","Complete Audit",completeCycle,{disabled:S.cfg.ccComplete||!readyState(t),
-        title:!readyState(t)?"Complete or delete every shelf first":""}))));
+      el("button",{class:"btn hv",onclick(){S.view="setup";render()}},"Upload New Bins"))));
   host.append(el("div",{class:"tiles"},
     tile("Total Shelves",fmt(t.shelves),fmt(t.done)+" completed","b"),
     tile("Scanned Shelves",fmt(t.done),pct.toFixed(1)+"% complete","g"),
@@ -859,7 +838,7 @@ function vDash(host,t){
   const reports=el("div",{class:"card"});reports.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Quick Report Downloads"}),el("button",{class:"btn ghost sm",onclick(){S.view="export";render()}},"View All →")));
   const rl=el("div",{class:"report-list"});[["Scan Data","csvScans","SCAN-DATA.csv"],["Bin Summary","csvBins","BIN-SUMMARY.csv"],["SKU Summary","csvSkus","SKU-SUMMARY.csv"],["Shelf Life","csvBrackets","SHELF-LIFE.csv"],["Final Report","csvFullReport","FINAL-REPORT.csv"]].forEach(([label,fn,file])=>rl.append(el("div",{class:"report-row"},el("span",{class:"report-name",text:label}),el("button",{class:"btn hv",onclick(){if(typeof window[fn]==="function")download(file,toCsv(window[fn]()))}},"Download"))));reports.append(rl);
 
-  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"CC ID: ",el("b",{text:S.cfg.ccId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:S.cloud.url&&!S.cloud.err?"Synced":"Local / Not linked"})),el("div",{class:"sync-ok",style:"margin-top:8px"},S.cloud.url&&!S.cloud.err?"Data synced across devices":"Ready for Google Sheet sync")));
+  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"Task ID: ",el("b",{text:S.cfg.taskId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:S.cloud.url&&!S.cloud.err?"Synced":"Local / Not linked"})),el("div",{class:"sync-ok",style:"margin-top:8px"},S.cloud.url&&!S.cloud.err?"Data synced across devices":"Ready for Google Sheet sync")));
 
   const team=el("div",{class:"card"});
   team.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Team Progress (User-wise)"}),
@@ -893,10 +872,32 @@ function vDash(host,t){
 }
 function readyState(t){return t.shelves>0&&t.stats.every(s=>s.state==="done")}
 
-function downloadCategoryTemplate(){
-  S.cfg.templateDownloaded=true; save("state");
-  const rows=[["Category","Shelf","SKU","Qty"],["Apparel","A-01-01","SKU-1001",10],["Cosmetics","A-01-02","SKU-2001",5],["Electronics","A-01-03","SKU-3001",8]];
-  download("CYCLE-COUNT-CATEGORY-TEMPLATE.csv",toCsv(rows));
+async function downloadCategoryTemplate(){
+  // Template download must work directly in the browser; do not depend on the
+  // optional Downloads helper, which may not be available in every deployment.
+  S.cfg.templateDownloaded=true;
+  save("state");
+  const rows=[["Category","Shelf","SKU","Qty"],
+    ["Apparel","A-01-01","SKU-1001",10],
+    ["Cosmetics","A-01-02","SKU-2001",5],
+    ["Electronics","A-01-03","SKU-3001",8]];
+  const csv="\uFEFF"+toCsv(rows);
+  try{
+    const blob=new Blob([csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download="STOCK-AUDIT-WMS-TEMPLATE.csv";
+    a.style.display="none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1500);
+    toast("Template downloaded","good");
+    render();
+  }catch(e){
+    toast("Template download failed — please try again","err");
+  }
 }
 
 /*────── SETUP ──────*/
@@ -938,12 +939,20 @@ function vSetup(host,t){
       el("button",{class:"btn ghost",onclick:()=>file.click()},"Choose CSV file"),
       el("button",{class:"btn hv",onclick(){
         if(!P){toast("Nothing to load","err");return}
-        if(S.cfg.ccComplete){toast("Create a new CC before adding stock rows","err");return}
-        const mm=new Map(S.master.map(r=>[[r.shelf,r.sku].join("\u0000"),r]));
-        P.rows.forEach(r=>mm.set([r.shelf,r.sku].join("\u0000"),r));
-        S.master=[...mm.values()]; S.cfg.deletedShelves={};
-        save("master","state");toast(fmt(P.rows.length)+" rows added/updated","good");
-        S.view="scan";render()}},S.master.length?"Add / Update Stock List":"Create Count Task"),file),
+        const oldTask=S.cfg.taskId||"";
+        const now=new Date();
+        const shelves=[...new Set(P.rows.map(r=>r.shelf))];
+        // IMPORTANT: upload is the task boundary. Replace the previous bin list
+        // instead of merging it, so old completed bins can never enter the new task.
+        S.master=P.rows.map(r=>Object.assign({},r));
+        S.lines=[]; S.shelfDone={}; S.cfg.shelfLocks={}; S.cfg.deletedShelves={};
+        S.cfg.taskId=makeTaskId(); S.cfg.taskStartedAt=now.toISOString();
+        S.cfg.taskStatus="OPEN"; S.cfg.taskCompletedAt="";
+        S.cfg.previousTaskId=oldTask;
+        S.activeShelf=null; S.editId=null;
+        save("master","lines","state");
+        toast("New audit task created · "+shelves.length+" bins · "+now.toLocaleString("en-IN"),"good");
+        S.view="scan";render()}},"Create New Audit Task"),file),
     out);
   host.append(c1);
 
@@ -951,7 +960,7 @@ function vSetup(host,t){
   c2.append(el("h3",{text:"3 · Count details"}));
   const mk=(lab,val,ph,on,type)=>el("label",{class:"f"},el("span",{text:lab}),
     el("input",{type:type||"text",value:val,placeholder:ph,oninput:on}));
-  c2.append(el("div",{class:"card",style:"margin:0 0 10px;background:var(--panel-2)"},el("div",{class:"code",text:"Current CC ID: "+(S.cfg.ccId||"—")}),el("div",{class:"hint",text:S.cfg.ccComplete?"Closed":"Open"})));
+  c2.append(el("div",{class:"card",style:"margin:0 0 10px;background:var(--panel-2)"},el("div",{class:"code",text:"Current Audit Task: "+(S.cfg.taskId||"—")}),el("div",{class:"hint",text:S.cfg.taskStartedAt?"Started "+tstamp(S.cfg.taskStartedAt):"No task yet"})));
   c2.append(el("div",{class:"oner",style:"grid-template-columns:repeat(auto-fit,minmax(190px,1fr))"},
     mk("Count reference",S.cfg.job,"Cycle count — Zone A — wk 38",e=>{S.cfg.job=e.target.value;save("state")}),
     mk("Author name",S.cfg.author,"Arvind Kumar",e=>{S.cfg.author=e.target.value;save("state")}),
@@ -1031,7 +1040,7 @@ function isCosmetics(c){return norm(c)==="COSMETICS"}
 function shelfLock(shelf){return (S.cfg.shelfLocks||{})[shelf]||null}
 function myShelfLock(shelf){const x=shelfLock(shelf);return x&&x.by===S.me.id}
 async function claimShelf(shelf){
-  if(S.cfg.ccComplete)throw new Error("Cycle count is completed");
+  if(S.cfg.taskStatus==="COMPLETE")throw new Error("Audit task is completed. Upload new bins for the next task.");
   const lock=shelfLock(shelf);
   if(lock&&lock.by!==S.me.id)throw new Error("This shelf is already locked by another user");
   if(lock&&lock.by===S.me.id)return true;
@@ -1070,9 +1079,9 @@ function userVisibleLines(){
 /*────── SCAN ──────*/
 function vScan(host,t){
   cycleControl(host,t);
-  if(S.cfg.ccComplete){
-    host.append(el("div",{class:"banner",text:(S.cfg.ccId||"CC")+" is closed. All shelf locks are released. Create a New CC to scan again."}));
-    if(isAdmin())host.append(tapTwice("btn hv","Create New CC",startNewCC));
+  if(S.cfg.taskStatus==="COMPLETE"){
+    host.append(el("div",{class:"banner",text:"This audit task is completed. Upload new bins to create the next task."}));
+    host.append(el("button",{class:"btn hv",onclick(){S.view="setup";render()}},"Upload New Bins"));
     return
   }
   if(!S.master.length){host.append(el("h2",{text:"Scan & count"}),noData("No count task loaded"));return}
@@ -1093,7 +1102,7 @@ function vScan(host,t){
       const hit=t.stats.filter(s=>s.shelf===v)[0]||t.stats.filter(s=>flat(s.shelf)===flat(v))[0];
       if(!hit){toast("Shelf "+v+" is not in this count","err");jump.select();return}
       if(hit.done){toast("Shelf "+v+" is already completed and locked","err");jump.select();return}
-      if(S.cfg.ccComplete){toast("Cycle count is completed","err");jump.select();return}
+      if(S.cfg.taskStatus==="COMPLETE"){toast("Audit task is completed. Upload new bins for the next task.","err");jump.select();return}
       jump.value=""; (async()=>{ if(!(await claimShelf(hit.shelf))) return; S.activeShelf=hit.shelf;S.editId=null;render() })()}});
   host.append(el("div",{class:"card"},el("label",{class:"f"},el("span",{text:"Shelf scan"}),jump)));
   setTimeout(()=>jump.focus(),30);
@@ -1115,7 +1124,7 @@ function vScan(host,t){
     list.forEach(s=>{const p=s.skuTotal?Math.min(100,s.skuCounted/s.skuTotal*100):(s.lines?100:0);
       const card=el("div",{class:"shcard "+s.state});
       card.append(
-        tapTwice("btn ghost sm","Delete",()=>deleteShelf(s.shelf),{disabled:s.done||S.cfg.ccComplete,
+        tapTwice("btn ghost sm","Delete",()=>deleteShelf(s.shelf),{disabled:s.done||S.cfg.taskStatus==="COMPLETE",
           title:s.done?"Reopen the shelf first":"",style:"float:right"}),
         el("div",{class:"id",text:s.shelf}),
         el("div",{class:"mt",text:s.skuCounted+"/"+s.skuTotal+" SKU · sys "+fmt(s.sysQty)}),
@@ -1124,7 +1133,7 @@ function vScan(host,t){
           el("span",{class:"tag "+(s.state==="done"?"ok":s.state==="part"?"warn":"idle"),text:s.state==="done"?"Completed":s.state==="part"?"In progress":"Pending"}),
           s.lines?el("span",{class:"code",style:"color:var(--ink-2)",text:fmt(s.cntQty)+(s.done?" ("+sgn(s.diff)+")":"")}):null),
         s.by?el("div",{class:"mt",style:"margin:5px 0 0",text:"by "+s.by}):null,
-        el("button",{class:"btn ghost block",style:"margin-top:6px",disabled:s.done||S.cfg.ccComplete,onclick(){if(!s.done){(async()=>{if(!(await claimShelf(s.shelf)))return;S.activeShelf=s.shelf;S.editId=null;render()})()}}},s.done?"Completed & Locked":"Open Shelf")
+        el("button",{class:"btn ghost block",style:"margin-top:6px",disabled:s.done||S.cfg.taskStatus==="COMPLETE",onclick(){if(!s.done){(async()=>{if(!(await claimShelf(s.shelf)))return;S.activeShelf=s.shelf;S.editId=null;render()})()}}},s.done?"Completed & Locked":"Open Shelf")
       );
       grid.append(card);
     });
@@ -1141,7 +1150,7 @@ function scanShelf(host){
   const mRows=S.master.filter(r=>r.shelf===shelf);
   const skuIdx=new Map(mRows.map(r=>[r.sku,r]));
   const locked=st.done;
-  if(S.cfg.ccComplete){host.append(el("div",{class:"banner",text:"Cycle count completed — this shelf is locked."}));return}
+  if(S.cfg.taskStatus==="COMPLETE"){host.append(el("div",{class:"banner",text:"Audit task completed — this bin is locked."}));return}
 
   host.append(el("div",{class:"row",style:"margin-bottom:10px"},
     el("button",{class:"btn ghost sm",onclick(){S.activeShelf=null;S.editId=null;render()}},"← All shelves"),
@@ -1197,6 +1206,41 @@ function deleteScanLine(id){
   if(!confirm("Delete this scan entry?"))return;
   S.lines=S.lines.filter(x=>x.id!==id);
   save("lines"); toast("Entry deleted","good"); render();
+}
+
+function editScanLine(id){
+  const l=S.lines.find(x=>x.id===id);
+  if(!l){toast("Scan entry not found","err");return}
+  if(S.shelfDone[l.shelf]){toast("This bin is already submitted","err");return}
+  if(!canTouch(l)){toast("You can edit only your own scan entry","err");return}
+  const mine=l.userQty?num(l.userQty[S.me.id]):(l.by===S.me.id?num(l.qty):0);
+  if(mine<=0){toast("No editable quantity for your user","err");return}
+  const q=prompt("Enter revised quantity for "+l.sku+":",String(mine));
+  if(q===null)return;
+  const nq=Math.floor(num(q));
+  if(nq<1){toast("Quantity must be at least 1","err");return}
+  const delta=nq-mine;
+  l.userQty=l.userQty||{}; l.userQty[S.me.id]=nq;
+  l.qty=Math.max(0,num(l.qty)+delta);
+  l.ts=new Date().toISOString(); l.lastBy=S.me.id; l.lastByName=S.me.name;
+  save("lines");toast("Scan entry updated","good");render();
+}
+function deleteScanLine(id){
+  const l=S.lines.find(x=>x.id===id);
+  if(!l){toast("Scan entry not found","err");return}
+  if(S.shelfDone[l.shelf]){toast("This bin is already submitted","err");return}
+  if(!canTouch(l)){toast("You can delete only your own scan entry","err");return}
+  if(!confirm("Delete this scan entry for "+l.sku+"?"))return;
+  const mine=l.userQty?num(l.userQty[S.me.id]):(l.by===S.me.id?num(l.qty):0);
+  if(isAdmin() || mine>=num(l.qty)){
+    S.lines=S.lines.filter(x=>x.id!==id);
+  }else{
+    l.qty=Math.max(0,num(l.qty)-mine);
+    if(l.userQty)delete l.userQty[S.me.id];
+    l.byNames=(l.byNames||[]).filter(n=>n!==S.me.name);
+    if(l.qty<=0)S.lines=S.lines.filter(x=>x.id!==id);
+  }
+  save("lines");toast("Scan entry deleted","good");render();
 }
 
 function shelfLineTable(shelf,locked){
@@ -1379,11 +1423,12 @@ function shelfRecon(shelf,st,locked){
     tile("SKU still open",fmt(pend),pend?"will report as short":"all covered",pend?"r":"g")));
   if(!locked) card.append(el("div",{class:"row",style:"margin-top:12px"},
     el("button",{class:"btn ok",onclick(){
-      if(!st.lines){toast("Scan at least one entry before submitting","err");return}
-      if(pend&&!confirm(pend+" SKU on this shelf are not counted.\n\nSubmit anyway? They will be reported short."))return;
+      if(pend&&!confirm(pend+" SKU on this bin are not counted.\n\nSubmit anyway? They will be reported short."))return;
       S.shelfDone[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString()};
-      save("state");toast("Shelf "+shelf+" completed","good");
-      S.activeShelf=null;S.editId=null;render();window.scrollTo({top:0})}},"Submit shelf & scan next"),
+      save("state");
+      const finished=autoCompleteTask();
+      toast(finished?"All bins completed. Audit task is automatically closed.":"Bin "+shelf+" completed","good");
+      S.activeShelf=null;S.editId=null;render();window.scrollTo({top:0})}},"Submit bin & scan next"),
     el("button",{class:"btn ghost",onclick(){S.activeShelf=null;S.editId=null;render()}},"Leave open")));
   return card;
 }
@@ -1729,11 +1774,11 @@ async function download(filename,data){
 }
 const qc=v=>{const s=String(v==null?"":v);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
 const toCsv=g=>g.map(r=>r.map(qc).join(",")).join("\n");
-const hdr=()=>[["Report",S.cfg.job||"Stock count"],["CC ID",S.cfg.ccId||""],["Author",S.cfg.author||""],["Site",S.cfg.site||""],
+const hdr=()=>[["Report",S.cfg.job||"Stock count"],["Task ID",S.cfg.taskId||""],["Author",S.cfg.author||""],["Site",S.cfg.site||""],
   ["Generated",new Date().toLocaleString("en-IN")],[]];
 function csvFullReport(){
   const sections=[
-    ["FINAL CYCLE COUNT REPORT"],
+    ["FINAL AUDIT TASK REPORT"],
     ...csvBins(),[],
     ["SKU SUMMARY"],...csvSkus(),[],
     ["SHELF LIFE"],...csvBrackets(),[],
