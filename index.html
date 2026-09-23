@@ -484,14 +484,6 @@ function save(...what){what.forEach(w=>S.dirty[w]=true);snap();clearTimeout(sT);
 let pT=null, pushing=false;
 function payload(){return{master:S.master,lines:S.lines,shelfDone:S.shelfDone,cfg:S.cfg,users:S.users,ccHistory:S.ccHistory}}
 function queuePush(){clearTimeout(pT);pT=setTimeout(()=>{cloudPush(true).catch(()=>{})},3500)}
-let syncPollT=null;
-function startCloudPolling(){
-  clearInterval(syncPollT);
-  syncPollT=setInterval(async()=>{
-    if(!S.booted||!S.me||!S.cloud.url||!S.cloud.key||pushing||Object.values(S.dirty).some(Boolean))return;
-    try{await cloudPull(true); if(S.view!=="scan"||!S.activeShelf) render();}catch(e){}
-  },5000);
-}
 function cloudChip(txt,cls){const c=$("#cloudChip");if(!c)return;
   c.className="chip"+(cls?" "+cls:"");c.textContent=txt}
 async function cloudCall(body,qs){
@@ -511,52 +503,14 @@ async function cloudPing(){
   const j=await cloudCall(null,"action=ping&key="+encodeURIComponent(S.cloud.key));
   S.cloud.err="";return j;
 }
-function mergeClientPayload(remote,local){
-  const r=remote||{}, l=local||{};
-  const byId=new Map();
-  (r.lines||[]).forEach(x=>byId.set(x.id||uid(),x));
-  (l.lines||[]).forEach(x=>byId.set(x.id||uid(),x));
-  const sd=Object.assign({},r.shelfDone||{},l.shelfDone||{});
-  const rc=r.cfg||{}, lc=l.cfg||{};
-  const sameCc=rc.ccId && lc.ccId && rc.ccId===lc.ccId;
-  let cfg;
-  if(rc.ccId && lc.ccId && rc.ccId!==lc.ccId){
-    const rt=Date.parse(rc.ccStartedAt||"")||0, lt=Date.parse(lc.ccStartedAt||"")||0;
-    cfg=Object.assign({}, rt>lt?rc:lc);
-  }else{
-    cfg=Object.assign({},rc,lc);
-    cfg.ccComplete=!!(rc.ccComplete||lc.ccComplete);
-    cfg.ccStatus=(cfg.ccComplete||rc.ccStatus==="CLOSED"||lc.ccStatus==="CLOSED")?"CLOSED":"OPEN";
-  }
-  cfg.deletedShelves=Object.assign({},rc.deletedShelves||{},lc.deletedShelves||{});
-  cfg.shelfLocks=sameCc?Object.assign({},rc.shelfLocks||{},lc.shelfLocks||{}):(cfg.shelfLocks||{});
-  const mm=new Map();
-  (r.master||[]).forEach(x=>mm.set([x.shelf,x.sku].join("\u0000"),x));
-  (l.master||[]).forEach(x=>mm.set([x.shelf,x.sku].join("\u0000"),x));
-  const deleted=cfg.deletedShelves||{};
-  const master=[...mm.values()].filter(x=>!deleted[x.shelf]);
-  const chosenCc=cfg.ccId||"";
-  let lines=[...byId.values()].filter(x=>!deleted[x.shelf]);
-  if(rc.ccId && lc.ccId && rc.ccId!==lc.ccId){
-    const source=(Date.parse(lc.ccStartedAt||"")||0) >= (Date.parse(rc.ccStartedAt||"")||0) ? l : r;
-    lines=(source.lines||[]).filter(x=>!deleted[x.shelf] && (!x.ccId || x.ccId===chosenCc));
-  }else if(chosenCc){
-    lines=lines.filter(x=>!x.ccId || x.ccId===chosenCc);
-  }
-  Object.keys(sd).forEach(k=>{if(deleted[k])delete sd[k]});
-  const hm=new Map();
-  (r.ccHistory||[]).forEach(x=>hm.set(x.id,x));
-  (l.ccHistory||[]).forEach(x=>hm.set(x.id,x));
-  const history=[...hm.values()].sort((a,b)=>String(a.closedAt||"").localeCompare(String(b.closedAt||"")));
-  return {master,lines,shelfDone:sd,cfg,users:l.users&&l.users.length?l.users:(r.users||[]),ccHistory:history};
-}
+/* Push-only by design. The app never pulls anything back into its own state —
+   that is what caused deleted/completed shelves to silently reappear before.
+   Each push simply mirrors this device's current data to the sheet; the
+   Apps Script side merges pushes from different devices together so the
+   sheet still reflects everyone's work, without the app ever reading it back. */
 async function cloudPush(silent){
   if(pushing)return; pushing=true; cloudChip("Sending…");
   try{
-    let latest={master:[],lines:[],shelfDone:{},cfg:{},users:[],ccHistory:[]};
-    try{const pj=await cloudCall(null,"action=pull&key="+encodeURIComponent(S.cloud.key));latest=pj.payload||latest}catch(e){}
-    const merged=mergeClientPayload(latest,payload());
-    S.master=merged.master;S.lines=merged.lines;S.shelfDone=migrate(merged.shelfDone);S.cfg=Object.assign(S.cfg,merged.cfg||{});S.users=merged.users||S.users;S.ccHistory=merged.ccHistory||S.ccHistory;
     const j=await cloudCall({key:S.cloud.key,action:"push",payload:payload()});
     S.cloud.lastPush=new Date().toISOString();S.cloud.err="";
     Object.keys(S.dirty).forEach(k=>S.dirty[k]=false);
@@ -568,15 +522,6 @@ async function cloudPush(silent){
     if(!silent)toast(e.message,"err");
     throw e;
   }finally{pushing=false}
-}
-async function cloudPull(silent){
-  const j=await cloudCall(null,"action=pull&key="+encodeURIComponent(S.cloud.key));
-  const p=j.payload||{};
-  if(!p.master&&!p.lines) throw new Error("The sheet has no saved count yet — push once first");
-  S.master=p.master||[];S.lines=p.lines||[];S.shelfDone=migrate(p.shelfDone||{});S.cfg=Object.assign(S.cfg,p.cfg||{});S.users=p.users||S.users;S.ccHistory=p.ccHistory||S.ccHistory;
-  S.cloud.lastPull=new Date().toISOString();S.cloud.err="";snap();
-  if(S.me)S.me=S.users.filter(u=>u.id===S.me.id)[0]||S.me;
-  if(!silent) render();
 }
 async function flush(){
   if(!DB||busy)return; busy=true;
@@ -615,8 +560,9 @@ async function boot(){
       ord(mc.docs).forEach(d=>{const r=d.data();if(r&&r.rows)m.push(...r.rows)});
       ord(lc.docs).forEach(d=>{const r=d.data();if(r&&r.rows)l.push(...r.rows)});
       if(m.length||l.length||st.exists||us.exists){
-        S.master=m;S.lines=l;
         const sd=st.exists?st.data():{};
+        const deleted=(sd.cfg&&sd.cfg.deletedShelves)||{};
+        S.master=m.filter(r=>!deleted[r.shelf]);S.lines=l.filter(x=>!deleted[x.shelf]);
         S.shelfDone=migrate(sd.shelfDone||{});S.cfg=Object.assign(S.cfg,sd.cfg||{});
         S.users=(us.exists&&us.data().list)||[];
         snap();
@@ -1091,8 +1037,9 @@ async function claimShelf(shelf){
   if(lock&&lock.by===S.me.id)return true;
   if(!SANDBOX&&S.cloud.url&&S.cloud.key){
     try{
-      const j=await cloudCall({key:S.cloud.key,action:"claim",shelf:shelf,user:{id:S.me.id,name:S.me.name}});
-      const p=j.payload||{};S.shelfDone=migrate(p.shelfDone||S.shelfDone);S.cfg=Object.assign(S.cfg,p.cfg||{});snap();return true;
+      await cloudCall({key:S.cloud.key,action:"claim",shelf:shelf,user:{id:S.me.id,name:S.me.name}});
+      S.cfg.shelfLocks=S.cfg.shelfLocks||{};S.cfg.shelfLocks[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString()};
+      save("state");return true;
     }catch(e){toast(e.message,"err");return false}
   }
   S.cfg.shelfLocks=S.cfg.shelfLocks||{};S.cfg.shelfLocks[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString()};save("state");return true;
@@ -1225,6 +1172,33 @@ function scanShelf(host){
   host.append(shelfRecon(shelf,st,locked));
 }
 
+function editScanLine(id){
+  const l=S.lines.find(x=>x.id===id);
+  if(!l){toast("Entry not found","err");return}
+  if(S.shelfDone[l.shelf]){toast("Submit ho chuka hai. Reopen shelf first.","err");return}
+  if(!isAdmin() && l.by!==S.me.id){toast("Only your own entry can be edited","err");return}
+  const qty=prompt("Enter physical quantity",String(l.qty));
+  if(qty===null)return;
+  const q=Math.floor(num(qty));
+  if(q<0){toast("Quantity cannot be negative","err");return}
+  const batch=prompt("Batch",l.batch||""); if(batch===null)return;
+  const mfg=prompt("MFG (YYYY-MM-DD)",l.mfg||""); if(mfg===null)return;
+  const exp=prompt("Expiry (YYYY-MM-DD)",l.exp||""); if(exp===null)return;
+  l.qty=q; l.batch=batch.trim(); l.mfg=mfg; l.exp=exp;
+  l.lastBy=S.me.id; l.lastByName=S.me.name; l.ts=new Date().toISOString();
+  if(l.userQty){ l.userQty[l.by||S.me.id]=q; }
+  save("lines"); toast("Entry updated","good"); render();
+}
+function deleteScanLine(id){
+  const l=S.lines.find(x=>x.id===id);
+  if(!l){toast("Entry not found","err");return}
+  if(S.shelfDone[l.shelf]){toast("Submit ho chuka hai. Reopen shelf first.","err");return}
+  if(!isAdmin() && l.by!==S.me.id){toast("Only your own entry can be deleted","err");return}
+  if(!confirm("Delete this scan entry?"))return;
+  S.lines=S.lines.filter(x=>x.id!==id);
+  save("lines"); toast("Entry deleted","good"); render();
+}
+
 function shelfLineTable(shelf,locked){
   const rows=userVisibleLines().filter(l=>l.shelf===shelf);
   const card=el("div",{class:"card"});
@@ -1248,14 +1222,18 @@ function shelfLineTable(shelf,locked){
       el("td",{class:"n",text:L?fmt(L.remDays):"—"}),
       el("td",{class:"n",style:"font-weight:600",text:fmt(l.qty)}),
       el("td",{text:who||"—"}),
-      el("td",{class:"code muted",text:tstamp(l.ts)})));
+      el("td",{class:"code muted",text:tstamp(l.ts)}),
+      el("td",{class:"nowrap"}, !locked ? [
+        el("button",{class:"btn ghost xs",style:"margin-right:4px",onclick(){editScanLine(l.id)}},"Edit"),
+        el("button",{class:"btn ghost xs",onclick(){deleteScanLine(l.id)}},"Delete")
+      ] : null)));
   });
   card.append(el("div",{class:"scroll cap"},el("table",{},el("thead",{},el("tr",{},
     el("th",{text:"SKU"}),el("th",{text:"Description"}),el("th",{text:"Category"}),
     el("th",{text:"Batch"}),el("th",{text:"MFG"}),el("th",{text:"Expiry"}),
     el("th",{class:"n",text:"Shelf life (mth)"}),el("th",{class:"n",text:"Current life %"}),
     el("th",{class:"n",text:"Current life (days)"}),el("th",{class:"n",text:"Qty"}),
-    el("th",{text:"Scanned by"}),el("th",{text:"Last scan"}))),tb)));
+    el("th",{text:"Scanned by"}),el("th",{text:"Last scan"}),el("th",{text:"Action"}))),tb)));
   return card;
 }
 
@@ -1833,12 +1811,15 @@ function csvUsers(){
 /*────── CLOUD SYNC ──────*/
 function vCloud(host){
   host.append(el("h2",{text:"Google Sheets sync"}));
-  host.append(el("p",{class:"sub",text:"Link this app to a Google Apps Script web app. Every scan then lands in your spreadsheet, and the auto-mailer sends the report from there at a fixed time."}));
+  host.append(el("p",{class:"sub",text:"Link this app to a Google Apps Script web app. Every scan on this device is mirrored to your spreadsheet in real time, for reporting and the auto-mailer."}));
 
   if(SANDBOX){
     host.append(el("div",{class:"banner w",
       text:"You are running the copy hosted inside Claude, which is not allowed to call other websites. Put the index.html file on GitHub Pages and open that link — the same settings below will work there."}));
   }
+
+  host.append(el("div",{class:"banner",
+    text:"This app only ever sends data to the sheet — it never reads scan data back. That one-way design is deliberate: pulling data back in was what caused deleted shelves to silently reappear and a fresh Cycle Count to show old shelves as still pending. Each device now stays fully in charge of its own count; the sheet is a real-time mirror for reports, the mailer and the leaderboard, not a second source the app trusts back."}));
 
   const c=el("div",{class:"card"});
   c.append(el("h3",{text:"Connection"}));
@@ -1861,12 +1842,7 @@ function vCloud(host){
       catch(e){st.className="hint bad";st.textContent=e.message}}},"Test connection"),
     el("button",{class:"btn hv",async onclick(){
       st.className="hint";st.textContent="Sending…";
-      try{await cloudPush(false)}catch(e){st.className="hint bad";st.textContent=e.message}}},"Send now"),
-    el("button",{class:"btn ghost",async onclick(){
-      if(!confirm("Pull the count from the sheet?\n\nWhat is on this device is replaced by what is stored there."))return;
-      st.className="hint";st.textContent="Pulling…";
-      try{await cloudPull();toast("Pulled from Google","good");render()}
-      catch(e){st.className="hint bad";st.textContent=e.message}}},"Pull from sheet")),st);
+      try{await cloudPush(false)}catch(e){st.className="hint bad";st.textContent=e.message}}},"Send now")),st);
   if(S.cloud.err) c.append(el("p",{class:"hint bad",text:"Last error: "+S.cloud.err}));
   host.append(c);
 
@@ -1874,19 +1850,23 @@ function vCloud(host){
     tile("Link status",S.cloud.url?(S.cloud.err?"Error":"Linked"):"Not set",
       S.cloud.url?"web app configured":"paste the /exec URL",S.cloud.err?"r":S.cloud.url?"g":""),
     tile("Last sent",S.cloud.lastPush?tstamp(S.cloud.lastPush):"—","scan data to Sheets","b"),
-    tile("Last pulled",S.cloud.lastPull?tstamp(S.cloud.lastPull):"—","count restored from Sheets","b"),
     tile("Auto send",S.cloud.auto?"On":"Off",S.cloud.auto?"a few seconds after each change":"manual only",
       S.cloud.auto?"g":"y")));
 
   host.append(el("div",{class:"card"},el("h3",{text:"What lands in the spreadsheet"}),
-    el("p",{class:"sub",style:"margin-bottom:8px",text:"Each push rebuilds five tabs so your charts and pivots keep pointing at the same cells:"}),
+    el("p",{class:"sub",style:"margin-bottom:8px",text:"Each push merges into the sheet (it never removes another device's work) and rebuilds six tabs so your charts and pivots keep pointing at the same cells:"}),
     el("ul",{style:"margin:0;padding-left:20px;color:var(--ink-2)"},
       el("li",{text:"Scan Data — every entry with shelf life, current life % and days, and the user who scanned it"}),
       el("li",{text:"Bin Summary — shelf-wise system vs physical and who submitted it"}),
       el("li",{text:"SKU Summary — SKU-wise totals across the warehouse"}),
       el("li",{text:"Shelf Life — the four brackets plus the SKU split inside each"}),
-      el("li",{text:"Users — per-user entries, quantity and shelves submitted"})),
-    el("p",{class:"hint",text:"A sixth tab, Mail List, is where you put the email IDs that get the scheduled report."})));
+      el("li",{text:"Users — per-user entries, quantity and shelves submitted"}),
+      el("li",{text:"CC History — every closed Cycle Count with its totals"})),
+    el("p",{class:"hint",text:"A seventh tab, Mail List, is where you put the email IDs that get the scheduled report."})));
+
+  host.append(el("div",{class:"card"},el("h3",{text:"Using more than one phone"}),
+    el("p",{class:"sub",style:"margin-bottom:0",
+      text:"Set up each phone the same way: link the same Web app URL and secret, upload the master stock list, and create each operator's login on that phone. Every phone then pushes its own scans to the same sheet, and the sheet's reports combine everyone's work — but no phone ever reads another phone's data back, so one person's deletes, edits, or a fresh Cycle Count can never silently change what another person sees on their screen."})));
 
   host.append(el("details",{class:"help"},el("summary",{text:"Setup in short"}),
     el("p",{html:"1. New Google Sheet → Extensions → Apps Script → paste <code>Code.gs</code> → set your own <code>SECRET</code>."}),
@@ -1975,7 +1955,7 @@ function vUsers(host){
 }
 
 window.addEventListener("beforeunload",snap);
-render(); boot().then(()=>startCloudPolling()).catch(()=>{});
+render(); boot();
 </script>
 </body>
 </html>
