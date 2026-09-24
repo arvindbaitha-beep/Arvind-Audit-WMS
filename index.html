@@ -348,6 +348,7 @@ const S={
   cfg:{minLifePct:50, job:"", author:"Arvind Kumar", site:"", taskId:"", taskStatus:"EMPTY", taskStartedAt:"", taskCompletedAt:"", previousTaskId:"", deletedShelves:{},shelfLocks:{}},
   cloud:{url:"", key:"", auto:true, lastPush:"", lastPull:"", err:""},
   me:null, view:"dash", activeShelf:null, editId:null,
+  idx:{masterShelf:new Map(), masterSku:new Map(), lineShelf:new Map(), lineKey:new Map()},
   filter:"all", q:"", bkFilter:"all", searchQ:"",
   booted:false, dirty:{master:false,lines:false,state:false,users:false}
 };
@@ -420,42 +421,48 @@ function life(mfg,exp){
 
 function reconcile(shelf){
   const m=new Map();
-  for(const r of S.master) if(r.shelf===shelf){
+  for(const r of masterRows(shelf)){
     const e=m.get(r.sku)||{sku:r.sku,desc:r.desc,uom:r.uom,systemQty:0,scanned:0,lines:[]};
-    e.systemQty+=r.qty; if(!e.desc)e.desc=r.desc; m.set(r.sku,e);}
-  for(const l of S.lines) if(l.shelf===shelf){
+    e.systemQty+=num(r.qty); if(!e.desc)e.desc=r.desc; m.set(r.sku,e);
+  }
+  for(const l of lineRows(shelf)){
     const e=m.get(l.sku)||{sku:l.sku,desc:"",uom:"",systemQty:0,scanned:0,lines:[],extra:true};
-    e.scanned+=l.qty; e.lines.push(l); m.set(l.sku,e);}
-  return [...m.values()].map(e=>({...e,diff:e.scanned-e.systemQty,touched:e.lines.length>0}))
-    .sort((a,b)=>a.sku<b.sku?-1:a.sku>b.sku?1:0);
+    e.scanned+=num(l.qty); e.lines.push(l); m.set(l.sku,e);
+  }
+  return [...m.values()].map(e=>({...e,diff:e.scanned-e.systemQty,touched:e.lines.length>0})).sort((a,b)=>a.sku<b.sku?-1:a.sku>b.sku?1:0);
 }
+function rebuildIndexes(){
+  const ix=S.idx={masterShelf:new Map(),masterSku:new Map(),lineShelf:new Map(),lineKey:new Map()};
+  for(const r of S.master){
+    if(!ix.masterShelf.has(r.shelf))ix.masterShelf.set(r.shelf,[]); ix.masterShelf.get(r.shelf).push(r);
+    ix.masterSku.set(String(r.shelf)+"\u0000"+String(r.sku),r);
+  }
+  for(const l of S.lines){
+    if(!ix.lineShelf.has(l.shelf))ix.lineShelf.set(l.shelf,[]); ix.lineShelf.get(l.shelf).push(l);
+    ix.lineKey.set(String(l.id),l);
+  }
+}
+function masterRows(shelf){return S.idx.masterShelf.get(shelf)||[]}
+function lineRows(shelf){return S.idx.lineShelf.get(shelf)||[]}
+
 function shelfStat(shelf){
-  const mR=S.master.filter(r=>r.shelf===shelf), lR=S.lines.filter(l=>l.shelf===shelf);
-  const sysQty=mR.reduce((s,r)=>s+r.qty,0), cntQty=lR.reduce((s,l)=>s+l.qty,0);
+  const mR=masterRows(shelf), lR=lineRows(shelf);
+  const sysQty=mR.reduce((x,r)=>x+num(r.qty),0), cntQty=lR.reduce((x,l)=>x+num(l.qty),0);
   const skuSet=new Set(mR.map(r=>r.sku)), cnt=new Set(lR.map(l=>l.sku));
   const sub=S.shelfDone[shelf]||null;
-  return{shelf,sysQty,cntQty,diff:cntQty-sysQty,skuTotal:skuSet.size,
-    skuCounted:[...cnt].filter(s=>skuSet.has(s)).length,
-    extraSku:[...cnt].filter(s=>!skuSet.has(s)).length,
-    lines:lR.length, sub, done:!!sub,
-    state:sub?"done":(lR.length?"part":"pending"),
-    by:sub?sub.byName:(lR.length?lR[lR.length-1].byName:"")};
+  let skuCounted=0,extraSku=0; for(const x of cnt)(skuSet.has(x)?skuCounted++:extraSku++);
+  return{shelf,sysQty,cntQty,diff:cntQty-sysQty,skuTotal:skuSet.size,skuCounted,extraSku,lines:lR.length,sub,done:!!sub,state:sub?"done":(lR.length?"part":"pending"),by:sub?sub.byName:(lR.length?lR[lR.length-1].byName:"")};
 }
 function allShelves(){
-  const k=new Set([...S.master.map(r=>r.shelf),...S.lines.map(l=>l.shelf)]);
+  const k=new Set(S.master.map(r=>r.shelf)); for(const l of S.lines)k.add(l.shelf);
   return [...k].sort().map(shelfStat);
 }
 function totals(){
   const st=allShelves();
-  const sysQty=S.master.reduce((s,r)=>s+r.qty,0), cntQty=S.lines.reduce((s,l)=>s+l.qty,0);
-  const sysK=new Set(S.master.map(r=>r.shelf+"\u0000"+r.sku));
-  const cntK=new Set(S.lines.map(l=>l.shelf+"\u0000"+l.sku));
-  let matched=0; cntK.forEach(k=>{if(sysK.has(k))matched++});
-  return{shelves:st.length, done:st.filter(s=>s.state==="done").length,
-    part:st.filter(s=>s.state==="part").length, pending:st.filter(s=>s.state==="pending").length,
-    skuTotal:sysK.size, skuCounted:matched, skuExtra:cntK.size-matched,
-    sysQty,cntQty,diff:cntQty-sysQty, lines:S.lines.length,
-    accuracy:sysQty>0?Math.max(0,100-Math.abs(cntQty-sysQty)/sysQty*100):0, stats:st};
+  let sysQty=0,cntQty=0; for(const r of S.master)sysQty+=num(r.qty); for(const l of S.lines)cntQty+=num(l.qty);
+  const sysK=new Set(),cntK=new Set(); for(const r of S.master)sysK.add(r.shelf+"\u0000"+r.sku); for(const l of S.lines)cntK.add(l.shelf+"\u0000"+l.sku);
+  let matched=0; for(const k of cntK)if(sysK.has(k))matched++;
+  return{shelves:st.length,done:st.filter(s=>s.state==="done").length,part:st.filter(s=>s.state==="part").length,pending:st.filter(s=>s.state==="pending").length,skuTotal:sysK.size,skuCounted:matched,skuExtra:cntK.size-matched,sysQty,cntQty,diff:cntQty-sysQty,lines:S.lines.length,accuracy:sysQty>0?Math.max(0,100-Math.abs(cntQty-sysQty)/sysQty*100):0,stats:st};
 }
 function bracketAgg(){
   const map={}; BRACKETS.forEach(b=>map[b.k]={...b,qty:0,lines:0,skus:new Set()});
@@ -472,12 +479,12 @@ function snap(){try{localStorage.setItem(LS,JSON.stringify(
 function loadLocal(){try{const d=JSON.parse(localStorage.getItem(LS)||"null");if(!d)return null;
   S.master=d.master||[];S.lines=d.lines||[];S.users=d.users||[];S.ccHistory=Array.isArray(d.ccHistory)?d.ccHistory:[];
   S.shelfDone=migrate(d.shelfDone||{});S.cfg=Object.assign(S.cfg,d.cfg||{});
-  S.cloud=Object.assign(S.cloud,d.cloud||{});return d.me}catch(e){return null}}
+  S.cloud=Object.assign(S.cloud,d.cloud||{});rebuildIndexes();return d.me}catch(e){return null}}
 function migrate(sd){const o={};for(const k in sd){const v=sd[k];
   o[k]=(v&&typeof v==="object")?v:{by:"",byName:"—",at:""}}return o}
 const chunk=(a,n)=>{const o=[];for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n));return o};
-let sT=null,busy=false;
-function save(...what){what.forEach(w=>S.dirty[w]=true);snap();clearTimeout(sT);sT=setTimeout(flush,450);
+let sT=null,busy=false,snapT=null,renderT=null;
+function save(...what){what.forEach(w=>S.dirty[w]=true);clearTimeout(snapT);snapT=setTimeout(snap,650);clearTimeout(sT);sT=setTimeout(flush,450);
   if(!SANDBOX&&S.cloud.auto&&S.cloud.url) queuePush()}
 
 /*────── Google Apps Script bridge ──────*/
@@ -565,6 +572,7 @@ async function boot(){
         S.master=m.filter(r=>!deleted[r.shelf]);S.lines=l.filter(x=>!deleted[x.shelf]);
         S.shelfDone=migrate(sd.shelfDone||{});S.cfg=Object.assign(S.cfg,sd.cfg||{});
         S.users=(us.exists&&us.data().list)||[];
+        rebuildIndexes();
         snap();
       }else if(S.master.length||S.lines.length||S.users.length){
         save("master","lines","state","users");
@@ -617,6 +625,8 @@ const NAV=[
   {v:"users",t:"User Management",i:"♙",c:"c8"}
 ];
 const VIEWC={dash:"c1",setup:"c2",scan:"c3",search:"c4",life:"c5",summary:"c6",export:"c7",cloud:"c9",users:"c8"};
+function scheduleRender(){clearTimeout(renderT);renderT=setTimeout(()=>render(),140)}
+
 function render(){
   const root=$("#root");
   if(!S.booted){root.replaceChildren(el("div",{class:"gate"},el("p",{class:"muted",text:"Loading…"})));return}
@@ -781,7 +791,7 @@ function deleteShelf(shelf){
   if(S.cfg.taskStatus==="COMPLETE"){toast("Task is already completed. Upload new bins to create a new task.","err");return}
   const st=shelfStat(shelf);
   if(st.done){toast("A completed bin can't be deleted — reopen it first if needed","err");return}
-  S.master=S.master.filter(r=>r.shelf!==shelf); S.lines=S.lines.filter(l=>l.shelf!==shelf);
+  S.master=S.master.filter(r=>r.shelf!==shelf); S.lines=S.lines.filter(l=>l.shelf!==shelf); rebuildIndexes();
   delete S.shelfDone[shelf]; if(S.cfg.shelfLocks)delete S.cfg.shelfLocks[shelf];
   if(S.activeShelf===shelf)S.activeShelf=null;
   save("master","lines","state");toast("Bin "+shelf+" deleted from current task","good");render();
@@ -1032,7 +1042,7 @@ function shelfCategory(shelf){
   return cats.length?cats[0]:"APPAREL";
 }
 function skuCategory(shelf,sku){
-  const row=S.master.find(r=>r.shelf===shelf&&r.sku===sku);
+  const row=S.idx.masterSku.get(String(shelf)+"\u0000"+String(sku));
   return row&&row.category?norm(row.category):shelfCategory(shelf);
 }
 function categoryLabel(c){const x=norm(c);return x?x.charAt(0)+x.slice(1).toLowerCase():"Apparel"}
@@ -1057,17 +1067,17 @@ function releaseShelfLock(shelf){
   if(!S.cfg.shelfLocks)return;
   if(isAdmin()||myShelfLock(shelf)){delete S.cfg.shelfLocks[shelf];save("state")}
 }
-function categoryScanCount(shelf,sku){return S.lines.filter(l=>l.shelf===shelf&&l.sku===sku).reduce((a,l)=>a+num(l.qty),0)}
-function systemSkuQty(shelf,sku){return S.master.filter(r=>r.shelf===shelf&&r.sku===sku).reduce((a,r)=>a+num(r.qty),0)}
+function categoryScanCount(shelf,sku){let n=0;for(const l of lineRows(shelf))if(l.sku===sku)n+=num(l.qty);return n}
+function systemSkuQty(shelf,sku){let n=0;for(const r of masterRows(shelf))if(r.sku===sku)n+=num(r.qty);return n}
 function appendScan(shelf,sku,extra){
   const category=extra.category||skuCategory(shelf,sku), key=(l)=>l.shelf===shelf&&l.sku===sku&&norm(l.category||category)===norm(category)&&String(l.batch||"")===String(extra.batch||"")&&String(l.mfg||"")===String(extra.mfg||"")&&String(l.exp||"")===String(extra.exp||"");
   const inc=Math.max(1,Math.floor(num(extra.qty))||1);
-  let row=S.lines.find(key);
+  let row=null; for(const l of lineRows(shelf)){if(key(l)){row=l;break}}
   if(row){row.qty=num(row.qty)+inc;row.ts=new Date().toISOString();row.lastBy=S.me.id;row.lastByName=S.me.name;row.byNames=Array.from(new Set([...(row.byNames||[]),S.me.name]));
     row.userQty=row.userQty||{};row.userQty[S.me.id]=num(row.userQty[S.me.id])+inc;
   }else{
     row={id:uid(),ccId:S.cfg.ccId||"",shelf,sku,category,batch:extra.batch||"",mfg:extra.mfg||"",exp:extra.exp||"",qty:inc,ts:new Date().toISOString(),by:S.me.id,byName:S.me.name,byNames:[S.me.name],userQty:{}};
-    row.userQty[S.me.id]=inc;S.lines.push(row);
+    row.userQty[S.me.id]=inc;S.lines.push(row); if(!S.idx.lineShelf.has(shelf))S.idx.lineShelf.set(shelf,[]); S.idx.lineShelf.get(shelf).push(row); S.idx.lineKey.set(String(row.id),row);
   }
   save("lines");
 }
@@ -1147,7 +1157,7 @@ function scanShelf(host){
   if(lock&&lock.by!==S.me.id){
     host.append(el("div",{class:"mode-banner"},el("div",{},el("strong",{text:"Shelf locked"}),el("div",{class:"hint",text:isAdmin()?"Locked by "+(lock.byName||"another user"):"This shelf is already assigned to another user."})),el("span",{class:"category-badge",text:categoryLabel(category)})));return;
   }
-  const mRows=S.master.filter(r=>r.shelf===shelf);
+  const mRows=masterRows(shelf);
   const skuIdx=new Map(mRows.map(r=>[r.sku,r]));
   const locked=st.done;
   if(S.cfg.taskStatus==="COMPLETE"){host.append(el("div",{class:"banner",text:"Audit task completed — this bin is locked."}));return}
@@ -1204,7 +1214,7 @@ function deleteScanLine(id){
   if(S.shelfDone[l.shelf]){toast("Submit ho chuka hai. Reopen shelf first.","err");return}
   if(!isAdmin() && l.by!==S.me.id){toast("Only your own entry can be deleted","err");return}
   if(!confirm("Delete this scan entry?"))return;
-  S.lines=S.lines.filter(x=>x.id!==id);
+  S.lines=S.lines.filter(x=>x.id!==id); rebuildIndexes();
   save("lines"); toast("Entry deleted","good"); render();
 }
 
@@ -1244,14 +1254,14 @@ function deleteScanLine(id){
 }
 
 function shelfLineTable(shelf,locked){
-  const rows=userVisibleLines().filter(l=>l.shelf===shelf);
+  const rows=(isAdmin()?lineRows(shelf):userVisibleLines().filter(l=>l.shelf===shelf));
   const card=el("div",{class:"card"});
   card.append(el("h3",{text:"Scan lines on "+shelf+" ("+rows.length+")"}));
   if(!rows.length){card.append(el("p",{class:"muted",text:"Nothing scanned on this shelf yet."}));return card}
   const tb=el("tbody");
   rows.slice().sort((a,b)=>String(b.ts||"").localeCompare(String(a.ts||""))).forEach(l=>{
     const L=life(l.mfg,l.exp);
-    const desc=(S.master.filter(r=>r.shelf===shelf&&r.sku===l.sku&&r.desc)[0]||{}).desc||"";
+    const desc=(S.idx.masterSku.get(String(shelf)+"\u0000"+String(l.sku))||{}).desc||"";
     const cat=l.category||skuCategory(shelf,l.sku);
     const who=(l.byNames&&l.byNames.length?l.byNames:[l.byName]).filter(Boolean).join(", ");
     tb.append(el("tr",{},
@@ -1283,7 +1293,7 @@ function shelfLineTable(shelf,locked){
 
 function entryRow(shelf,skuIdx){
   const card=el("div",{class:"scan-focus"});
-  const targetRows=S.master.filter(r=>r.shelf===shelf), target=new Map();
+  const targetRows=masterRows(shelf), target=new Map();
   targetRows.forEach(r=>target.set(r.sku,(target.get(r.sku)||0)+num(r.qty)));
   const counted=sku=>categoryScanCount(shelf,sku);
   const title=el("div",{class:"mode-banner"},
@@ -1292,7 +1302,7 @@ function entryRow(shelf,skuIdx){
     el("span",{class:"category-badge",text:"SKU Category"}));
   card.append(title);
   const progress=el("div",{class:"tiles"},
-    tile("Units scanned",fmt(S.lines.filter(l=>l.shelf===shelf).reduce((a,l)=>a+l.qty,0)),"live"),
+    tile("Units scanned",fmt(lineRows(shelf).reduce((a,l)=>a+l.qty,0)),"live"),
     tile("System units",fmt(targetRows.reduce((a,r)=>a+num(r.qty),0)),"reference only","b"),
     tile("SKU lines",fmt(new Set(targetRows.map(r=>r.sku)).size),"master SKUs","y"));
   card.append(progress);
@@ -1379,8 +1389,8 @@ function entryRow(shelf,skuIdx){
     }
     appendScan(shelf,v,{category:cat,batch:batch.value.trim(),mfg:mfg.value||"",exp:exp.value||"",qty:q});
     batch.value="";mfg.value="";exp.value="";qty.value="1";sku.value="";extraWrap.style.display="none";add.style.display="none";
-    mode.className="hint ok";mode.textContent=fmt(q)+" pc saved. Scan the next SKU.";render();
-    setTimeout(()=>{const x=document.querySelector('.scan-input');if(x)x.focus()},40);
+    mode.className="hint ok";mode.textContent=fmt(q)+" pc saved. Scan the next SKU.";scheduleRender();
+    sku.focus();
   }
   setTimeout(()=>sku.focus(),40);
   return card;
@@ -1405,8 +1415,10 @@ function shelfRecon(shelf,st,locked){
       el("td",{text:who||"—"}),
       el("td",{},el("span",{class:"tag "+cls,text:lab})),
       el("td",{class:"n"}, locked?null:(!r.touched?el("button",{class:"btn ghost xs",onclick(){
-        S.lines.push({id:uid(),shelf:shelf,sku:r.sku,batch:"",mfg:"",exp:"",qty:0,
-          ts:new Date().toISOString(),by:S.me.id,byName:S.me.name,nil:true});
+        const nil={id:uid(),shelf:shelf,sku:r.sku,batch:"",mfg:"",exp:"",qty:0,
+          ts:new Date().toISOString(),by:S.me.id,byName:S.me.name,nil:true};
+        S.lines.push(nil);
+        if(!S.idx.lineShelf.has(shelf))S.idx.lineShelf.set(shelf,[]); S.idx.lineShelf.get(shelf).push(nil); S.idx.lineKey.set(String(nil.id),nil);
         save("lines");toast(r.sku+" marked nil");render()}},"Mark nil"):null))));
   });
   card.append(el("div",{class:"scroll cap"},el("table",{},el("thead",{},el("tr",{},
@@ -2001,6 +2013,7 @@ function vUsers(host){
 
 window.addEventListener("beforeunload",snap);
 render(); boot();
+window.addEventListener("pagehide",()=>{try{snap()}catch(e){}});
 </script>
 </body>
 </html>
