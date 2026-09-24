@@ -510,11 +510,46 @@ async function cloudPing(){
   const j=await cloudCall(null,"action=ping&key="+encodeURIComponent(S.cloud.key));
   S.cloud.err="";return j;
 }
-/* Push-only by design. The app never pulls anything back into its own state —
-   that is what caused deleted/completed shelves to silently reappear before.
-   Each push simply mirrors this device's current data to the sheet; the
-   Apps Script side merges pushes from different devices together so the
-   sheet still reflects everyone's work, without the app ever reading it back. */
+async function cloudPullMeta(silent){
+  if(SANDBOX||!S.cloud.url||!S.cloud.key)return null;
+  try{
+    const j=await cloudCall(null,"action=meta&key="+encodeURIComponent(S.cloud.key));
+    const d=j.data||{};
+    const remoteTask=String((d.cfg&&d.cfg.taskId)||"");
+    const localTask=String(S.cfg.taskId||"");
+    if(remoteTask && remoteTask!==localTask){
+      // A new upload is a hard task boundary. Replace local task data completely.
+      S.master=Array.isArray(d.master)?d.master:[];
+      S.lines=[];
+      S.shelfDone=migrate(d.shelfDone||{});
+      S.cfg=Object.assign(S.cfg,d.cfg||{});
+      S.activeShelf=null; S.editId=null;
+      rebuildIndexes(); snap();
+      if(!silent){toast("New audit task received from another user","good");render()}
+    }else{
+      // Same task: only synchronize shared ownership/completion metadata.
+      S.shelfDone=migrate(d.shelfDone||{});
+      S.cfg.shelfLocks=d.cfg&&d.cfg.shelfLocks?d.cfg.shelfLocks:{};
+      if(d.cfg&&d.cfg.taskStatus)S.cfg.taskStatus=d.cfg.taskStatus;
+      if(d.cfg&&d.cfg.taskCompletedAt)S.cfg.taskCompletedAt=d.cfg.taskCompletedAt;
+      snap();
+    }
+    S.cloud.lastPull=new Date().toISOString();S.cloud.err="";
+    return d;
+  }catch(e){S.cloud.err=e.message;return null}
+}
+let pullT=null;
+function startCloudPolling(){
+  clearInterval(pullT);
+  if(SANDBOX||!S.cloud.url||!S.cloud.key)return;
+  pullT=setInterval(()=>{cloudPullMeta(true).then(()=>{
+    if(S.view==="scan" && !S.activeShelf)render();
+  }).catch(()=>{})},5000);
+}
+/* Shared-task sync. Google Apps Script is the shared source for the current task.
+   New uploads replace the current task for everyone. Bin claims are checked
+   atomically by Apps Script. The browser polls shared task metadata so a bin
+   opened by one user becomes locked on the other users' devices. */
 async function cloudPush(silent){
   if(pushing)return; pushing=true; cloudChip("Sending…");
   try{
@@ -580,7 +615,12 @@ async function boot(){
     }catch(e){}
   }
   if(meId) S.me=S.users.find(u=>u.id===meId)||null;
-  ensureTask(); S.booted=true; render();
+  ensureTask();
+  if(!SANDBOX&&S.cloud.url&&S.cloud.key){
+    await cloudPullMeta(false);
+    startCloudPolling();
+  }
+  S.booted=true; render();
 }
 
 async function hash(pw){
@@ -947,22 +987,25 @@ function vSetup(host,t){
     el("label",{class:"f"},el("span",{text:"Paste rows, or load a CSV"}),ta),
     el("div",{class:"row",style:"margin-top:10px"},
       el("button",{class:"btn ghost",onclick:()=>file.click()},"Choose CSV file"),
-      el("button",{class:"btn hv",onclick(){
+      el("button",{class:"btn hv",onclick:async function(){
         if(!P){toast("Nothing to load","err");return}
         const oldTask=S.cfg.taskId||"";
         const now=new Date();
         const shelves=[...new Set(P.rows.map(r=>r.shelf))];
-        // IMPORTANT: upload is the task boundary. Replace the previous bin list
-        // instead of merging it, so old completed bins can never enter the new task.
-        S.master=P.rows.map(r=>Object.assign({},r));
-        S.lines=[]; S.shelfDone={}; S.cfg.shelfLocks={}; S.cfg.deletedShelves={};
-        S.cfg.taskId=makeTaskId(); S.cfg.taskStartedAt=now.toISOString();
-        S.cfg.taskStatus="OPEN"; S.cfg.taskCompletedAt="";
-        S.cfg.previousTaskId=oldTask;
-        S.activeShelf=null; S.editId=null;
-        save("master","lines","state");
-        toast("New audit task created · "+shelves.length+" bins · "+now.toLocaleString("en-IN"),"good");
-        S.view="scan";render()}},"Create New Audit Task"),file),
+        const taskId=makeTaskId();
+        const nextCfg=Object.assign({},S.cfg,{taskId,taskStartedAt:now.toISOString(),taskStatus:"OPEN",taskCompletedAt:"",previousTaskId:oldTask,deletedShelves:{},shelfLocks:{}});
+        try{
+          if(!SANDBOX&&S.cloud.url&&S.cloud.key){
+            await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:P.rows.map(r=>Object.assign({},r)),cfg:nextCfg,shelfDone:{}}});
+          }
+          S.master=P.rows.map(r=>Object.assign({},r));
+          S.lines=[]; S.shelfDone={}; S.cfg=nextCfg;
+          S.activeShelf=null; S.editId=null; rebuildIndexes();
+          save("master","lines","state");
+          toast("New audit task created and shared · "+shelves.length+" bins · "+now.toLocaleString("en-IN"),"good");
+          S.view="scan";render();
+        }catch(e){toast("Task upload failed: "+(e.message||"Please check Google sync"),"err")}
+      }},"Create New Audit Task"),file),
     out);
   host.append(c1);
 
@@ -1056,8 +1099,9 @@ async function claimShelf(shelf){
   if(lock&&lock.by===S.me.id)return true;
   if(!SANDBOX&&S.cloud.url&&S.cloud.key){
     try{
-      await cloudCall({key:S.cloud.key,action:"claim",shelf:shelf,user:{id:S.me.id,name:S.me.name}});
-      S.cfg.shelfLocks=S.cfg.shelfLocks||{};S.cfg.shelfLocks[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString()};
+      const j=await cloudCall({key:S.cloud.key,action:"claim",taskId:S.cfg.taskId,shelf:shelf,user:{id:S.me.id,name:S.me.name}});
+      S.cfg.shelfLocks=S.cfg.shelfLocks||{};
+      S.cfg.shelfLocks[shelf]=(j.lock||{by:S.me.id,byName:S.me.name,at:new Date().toISOString()});
       save("state");return true;
     }catch(e){toast(e.message,"err");return false}
   }
@@ -1868,7 +1912,7 @@ function csvUsers(){
 /*────── CLOUD SYNC ──────*/
 function vCloud(host){
   host.append(el("h2",{text:"Google Sheets sync"}));
-  host.append(el("p",{class:"sub",text:"Link this app to a Google Apps Script web app. Every scan on this device is mirrored to your spreadsheet in real time, for reporting and the auto-mailer."}));
+  host.append(el("p",{class:"sub",text:"Link this app to the shared Google Apps Script backend. Any user can upload the current bin list, all users see the same bins, and once one user opens a bin it is locked for other users."}));
 
   if(SANDBOX){
     host.append(el("div",{class:"banner w",
