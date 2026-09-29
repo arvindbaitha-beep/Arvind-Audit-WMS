@@ -334,7 +334,11 @@ input,select,textarea{background:#fff;border:1px solid #ccd9e6;border-radius:8px
 <div id="root"></div>
 <script>
 "use strict";
-const APP="Stock Audit WMS", LS="wms.sc.v2";
+const APP="Stock Audit WMS", LS="wms.sc.v3";
+/* CENTRAL BACKEND: set these two values once before publishing the app.
+   After that, normal users never enter a Google Sheet URL or secret. */
+const CENTRAL_API_URL="https://script.google.com/macros/s/AKfycbyGlBI-7MtIGj6hPqYISUceNz9nAPgtLaIIaMNcj5DcQmaJzt1N10k1qdNaiaXwiuC7PQ/exec";
+const CENTRAL_KEY="Arvind-Audit-WMS";
 const BRACKETS=[
   {k:"b60",label:"Above 60%",min:60,max:Infinity,cls:"ok",   note:"Fresh stock"},
   {k:"b40",label:"40% to 60%",min:40,max:60,     cls:"info", note:"Normal rotation"},
@@ -346,14 +350,26 @@ const bracketOf=p=>BRACKETS.find(b=>p>=b.min&&p<b.max)||BRACKETS[3];
 const S={
   master:[], lines:[], shelfDone:{}, users:[], ccHistory:[],
   cfg:{minLifePct:50, job:"", author:"Arvind Kumar", site:"", taskId:"", taskStatus:"EMPTY", taskStartedAt:"", taskCompletedAt:"", previousTaskId:"", deletedShelves:{},shelfLocks:{}},
-  cloud:{url:"", key:"", auto:true, lastPush:"", lastPull:"", err:""},
+  cloud:{url:CENTRAL_API_URL, key:CENTRAL_KEY, auto:true, lastPush:"", lastPull:"", err:""},
   me:null, view:"dash", activeShelf:null, editId:null,
   idx:{masterShelf:new Map(), masterSku:new Map(), lineShelf:new Map(), lineKey:new Map()},
   filter:"all", q:"", bkFilter:"all", searchQ:"",
-  booted:false, dirty:{master:false,lines:false,state:false,users:false}
+  booted:false, deletedLineIds:[], dirty:{master:false,lines:false,state:false,users:false}
 };
 let DB=null, DL=null;
 const SANDBOX = !!(typeof window!=="undefined" && window.claude && window.claude.use);
+/* Only the published GitHub Pages site may contact the central backend.
+   Local files and embedded Preview environments stay offline, avoiding repeated
+   host-level network permission prompts. */
+const NETWORK_ENABLED = !!(typeof window!=="undefined" && window.location &&
+  window.location.protocol==="https:" &&
+  window.location.hostname==="arvindbaitha-beep.github.io" &&
+  window.location.pathname.indexOf("/WMS-for-Inventory-Audit-")===0);
+/* Network access is enabled only on the published HTTPS GitHub Pages site.
+   Local files and embedded Preview panes stay offline, avoiding repeated
+   "Allow network access?" prompts. */
+const HOSTED_WMS = typeof location!=="undefined" && location.protocol==="https:" && location.hostname==="arvindbaitha-beep.github.io";
+const CLOUD_ENABLED = HOSTED_WMS && !SANDBOX;
 
 const $=s=>document.querySelector(s);
 const el=(t,a,...c)=>{const n=document.createElement(t);
@@ -479,25 +495,25 @@ function snap(){try{localStorage.setItem(LS,JSON.stringify(
 function loadLocal(){try{const d=JSON.parse(localStorage.getItem(LS)||"null");if(!d)return null;
   S.master=d.master||[];S.lines=d.lines||[];S.users=d.users||[];S.ccHistory=Array.isArray(d.ccHistory)?d.ccHistory:[];
   S.shelfDone=migrate(d.shelfDone||{});S.cfg=Object.assign(S.cfg,d.cfg||{});
-  S.cloud=Object.assign(S.cloud,d.cloud||{});rebuildIndexes();return d.me}catch(e){return null}}
+  S.cloud=Object.assign(S.cloud,d.cloud||{}); S.cloud.url=CENTRAL_API_URL; S.cloud.key=CENTRAL_KEY; rebuildIndexes();return d.me}catch(e){return null}}
 function migrate(sd){const o={};for(const k in sd){const v=sd[k];
   o[k]=(v&&typeof v==="object")?v:{by:"",byName:"—",at:""}}return o}
 const chunk=(a,n)=>{const o=[];for(let i=0;i<a.length;i+=n)o.push(a.slice(i,i+n));return o};
 let sT=null,busy=false,snapT=null,renderT=null;
 function save(...what){what.forEach(w=>S.dirty[w]=true);clearTimeout(snapT);snapT=setTimeout(snap,650);clearTimeout(sT);sT=setTimeout(flush,450);
-  if(!SANDBOX&&S.cloud.auto&&S.cloud.url) queuePush()}
+  if(CLOUD_ENABLED&&S.cloud.auto&&S.cloud.url&&S.cloud.url.indexOf("__CENTRAL_")!==0) queuePush()}
 
 /*────── Google Apps Script bridge ──────*/
 let pT=null, pushing=false;
-function payload(){return{master:S.master,lines:S.lines,shelfDone:S.shelfDone,cfg:S.cfg,users:S.users,ccHistory:S.ccHistory}}
+function payload(){return{master:S.master,lines:S.lines,shelfDone:S.shelfDone,cfg:S.cfg,users:S.users,ccHistory:S.ccHistory,deletedLineIds:S.deletedLineIds||[],actorId:S.me&&S.me.id||"",userId:S.me&&S.me.id||""}}
 function queuePush(){clearTimeout(pT);pT=setTimeout(()=>{cloudPush(true).catch(()=>{})},3500)}
 function cloudChip(txt,cls){const c=$("#cloudChip");if(!c)return;
   c.className="chip"+(cls?" "+cls:"");c.textContent=txt}
 async function cloudCall(body,qs){
-  if(SANDBOX) throw new Error("Blocked inside Claude — run the GitHub Pages copy for this");
+  if(!CLOUD_ENABLED) throw new Error("Central sync is available only from the published GitHub Pages URL. Open the WMS website, not the local Preview/file.");
   const url=String(S.cloud.url||"").trim();
   if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url))
-    throw new Error("Paste the /exec web app URL from Apps Script first");
+    throw new Error("Central WMS backend is not configured yet");
   let res;
   if(qs){ res=await fetch(url+(url.indexOf("?")>=0?"&":"?")+qs,{method:"GET",redirect:"follow"}) }
   else  { res=await fetch(url,{method:"POST",redirect:"follow",body:JSON.stringify(body)}) }
@@ -511,28 +527,33 @@ async function cloudPing(){
   S.cloud.err="";return j;
 }
 async function cloudPullMeta(silent){
-  if(SANDBOX||!S.cloud.url||!S.cloud.key)return null;
+  if(!CLOUD_ENABLED||!S.cloud.url||!S.cloud.key||S.cloud.url.indexOf("__CENTRAL_")===0)return null;
   try{
-    const j=await cloudCall(null,"action=meta&key="+encodeURIComponent(S.cloud.key));
-    const d=j.data||{};
+    /* The central Apps Script is the shared source of truth. Pull the full
+       current task so every HHT sees the same bins, scans, locks and status. */
+    const j=await cloudCall(null,"action=pull&key="+encodeURIComponent(S.cloud.key));
+    const d=j.payload||{};
     const remoteTask=String((d.cfg&&d.cfg.taskId)||"");
     const localTask=String(S.cfg.taskId||"");
-    if(remoteTask && remoteTask!==localTask){
-      // A new upload is a hard task boundary. Replace local task data completely.
+    if(remoteTask!==localTask || (remoteTask && !localTask)){
       S.master=Array.isArray(d.master)?d.master:[];
-      S.lines=[];
+      S.lines=Array.isArray(d.lines)?d.lines:[];
       S.shelfDone=migrate(d.shelfDone||{});
       S.cfg=Object.assign(S.cfg,d.cfg||{});
-      S.activeShelf=null; S.editId=null;
+      S.users=Array.isArray(d.users)?d.users:S.users;
+      S.ccHistory=Array.isArray(d.ccHistory)?d.ccHistory:S.ccHistory;
+      S.deletedLineIds=[]; S.activeShelf=null; S.editId=null;
       rebuildIndexes(); snap();
-      if(!silent){toast("New audit task received from another user","good");render()}
+      if(!silent)toast(remoteTask?"Current audit task loaded from central server":"Central WMS connected","good");
     }else{
-      // Same task: only synchronize shared ownership/completion metadata.
+      S.master=Array.isArray(d.master)?d.master:S.master;
+      S.lines=Array.isArray(d.lines)?d.lines:S.lines;
       S.shelfDone=migrate(d.shelfDone||{});
-      S.cfg.shelfLocks=d.cfg&&d.cfg.shelfLocks?d.cfg.shelfLocks:{};
-      if(d.cfg&&d.cfg.taskStatus)S.cfg.taskStatus=d.cfg.taskStatus;
-      if(d.cfg&&d.cfg.taskCompletedAt)S.cfg.taskCompletedAt=d.cfg.taskCompletedAt;
-      snap();
+      S.cfg=Object.assign(S.cfg,d.cfg||{});
+      S.users=Array.isArray(d.users)?d.users:S.users;
+      S.ccHistory=Array.isArray(d.ccHistory)?d.ccHistory:S.ccHistory;
+      S.deletedLineIds=[];
+      rebuildIndexes(); snap();
     }
     S.cloud.lastPull=new Date().toISOString();S.cloud.err="";
     return d;
@@ -541,10 +562,8 @@ async function cloudPullMeta(silent){
 let pullT=null;
 function startCloudPolling(){
   clearInterval(pullT);
-  if(SANDBOX||!S.cloud.url||!S.cloud.key)return;
-  pullT=setInterval(()=>{cloudPullMeta(true).then(()=>{
-    if(S.view==="scan" && !S.activeShelf)render();
-  }).catch(()=>{})},5000);
+  if(!CLOUD_ENABLED||!S.cloud.url||!S.cloud.key||S.cloud.url.indexOf("__CENTRAL_")===0)return;
+  pullT=setInterval(()=>{cloudPullMeta(true).then(()=>{render()}).catch(()=>{})},2500);
 }
 /* Shared-task sync. Google Apps Script is the shared source for the current task.
    New uploads replace the current task for everyone. Bin claims are checked
@@ -553,7 +572,7 @@ function startCloudPolling(){
 async function cloudPush(silent){
   if(pushing)return; pushing=true; cloudChip("Sending…");
   try{
-    const j=await cloudCall({key:S.cloud.key,action:"push",payload:payload()});
+    const j=await cloudCall({key:S.cloud.key,action:"push",actorId:S.me&&S.me.id||"",payload:payload()});
     S.cloud.lastPush=new Date().toISOString();S.cloud.err="";
     Object.keys(S.dirty).forEach(k=>S.dirty[k]=false);
     snap();
@@ -616,7 +635,7 @@ async function boot(){
   }
   if(meId) S.me=S.users.find(u=>u.id===meId)||null;
   ensureTask();
-  if(!SANDBOX&&S.cloud.url&&S.cloud.key){
+  if(CLOUD_ENABLED&&S.cloud.url&&S.cloud.key){
     await cloudPullMeta(false);
     startCloudPolling();
   }
@@ -681,8 +700,8 @@ function render(){
         sv("path",{d:"M9 15.5l2 2 4-4",stroke:"#EDEFEA","stroke-width":2,"stroke-linecap":"round","stroke-linejoin":"round"})),
       el("div",{},el("b",{text:"Arvind"}),el("i",{text:"STOCK AUDIT WMS"}))),
     el("div",{class:"sp"}),
-    el("span",{class:"chip",id:"chip",text:DB?"Team · synced":SANDBOX?"This device only":"Self-hosted"}),
-    !SANDBOX?el("span",{class:"chip"+(S.cloud.url&&!S.cloud.err?" live":""),id:"cloudChip",
+    el("span",{class:"chip",id:"chip",text:DB?"Team · synced":!CLOUD_ENABLED?"Preview · offline":"Self-hosted"}),
+    CLOUD_ENABLED?el("span",{class:"chip"+(S.cloud.url&&!S.cloud.err?" live":""),id:"cloudChip",
       text:!S.cloud.url?"Sheet not linked":S.cloud.err?"Sync failed":"Sheet linked"}):null,
     el("div",{class:"who"},el("span",{class:"av",text:initials(S.me.name)}),
       el("span",{},S.me.name," ",el("span",{class:"tag "+(isAdmin()?"info":"idle"),text:isAdmin()?"Admin":"Operator"}))),
@@ -832,6 +851,7 @@ function deleteShelf(shelf){
   const st=shelfStat(shelf);
   if(st.done){toast("A completed bin can't be deleted — reopen it first if needed","err");return}
   S.master=S.master.filter(r=>r.shelf!==shelf); S.lines=S.lines.filter(l=>l.shelf!==shelf); rebuildIndexes();
+  S.cfg.deletedShelves=S.cfg.deletedShelves||{}; S.cfg.deletedShelves[shelf]=true;
   delete S.shelfDone[shelf]; if(S.cfg.shelfLocks)delete S.cfg.shelfLocks[shelf];
   if(S.activeShelf===shelf)S.activeShelf=null;
   save("master","lines","state");toast("Bin "+shelf+" deleted from current task","good");render();
@@ -888,7 +908,7 @@ function vDash(host,t){
   const reports=el("div",{class:"card"});reports.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Quick Report Downloads"}),el("button",{class:"btn ghost sm",onclick(){S.view="export";render()}},"View All →")));
   const rl=el("div",{class:"report-list"});[["Scan Data","csvScans","SCAN-DATA.csv"],["Bin Summary","csvBins","BIN-SUMMARY.csv"],["SKU Summary","csvSkus","SKU-SUMMARY.csv"],["Shelf Life","csvBrackets","SHELF-LIFE.csv"],["Final Report","csvFullReport","FINAL-REPORT.csv"]].forEach(([label,fn,file])=>rl.append(el("div",{class:"report-row"},el("span",{class:"report-name",text:label}),el("button",{class:"btn hv",onclick(){if(typeof window[fn]==="function")download(file,toCsv(window[fn]()))}},"Download"))));reports.append(rl);
 
-  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"Task ID: ",el("b",{text:S.cfg.taskId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:S.cloud.url&&!S.cloud.err?"Synced":"Local / Not linked"})),el("div",{class:"sync-ok",style:"margin-top:8px"},S.cloud.url&&!S.cloud.err?"Data synced across devices":"Ready for Google Sheet sync")));
+  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"Task ID: ",el("b",{text:S.cfg.taskId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:S.cloud.url&&!S.cloud.err?"Central Synced":"Not connected"})),el("div",{class:"sync-ok",style:"margin-top:8px"},S.cloud.url&&!S.cloud.err?"Data synced across devices":"Ready for Google Sheet sync")));
 
   const team=el("div",{class:"card"});
   team.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Team Progress (User-wise)"}),
@@ -953,15 +973,15 @@ async function downloadCategoryTemplate(){
 /*────── SETUP ──────*/
 function vSetup(host,t){
   host.append(el("h2",{text:"Upload the stock list"}));
-  host.append(el("p",{class:"sub",text:"First download the template, fill Category, Shelf, SKU and Qty, then upload the completed file. Scanning mode is decided by SKU category, not by shelf."}));
+  host.append(el("p",{class:"sub",text:"Download the template if you need it, or paste/select a CSV directly. Required columns: Category, Shelf, SKU and Qty. Scanning mode is decided by SKU category."}));
   host.append(el("div",{class:"card template-card"},el("div",{},el("h3",{text:"Category-wise upload template"}),el("p",{class:"hint",text:"Required columns: Category, Shelf, SKU, Qty · Category belongs to the SKU"})),el("button",{class:"btn hv",onclick:downloadCategoryTemplate},"Download Template")));
   cycleControl(host,t);
   if(S.master.length) host.append(el("div",{class:"tiles"},
     tile("Shelves",fmt(t.shelves)),tile("SKU lines",fmt(t.skuTotal)),
     tile("System quantity",fmt(t.sysQty)),tile("Scan entries",fmt(t.lines))));
 
-  const uploadUnlocked=!!S.cfg.templateDownloaded;
-  const ta=el("textarea",{rows:"8",disabled:!uploadUnlocked,placeholder:uploadUnlocked?"Category,Shelf,SKU,Qty\nApparel,A-01-01,SKU-1001,10\nCosmetics,A-01-02,SKU-2001,5\nElectronics,A-01-03,SKU-3001,8":"Download the template first"});
+  const uploadUnlocked=true;
+  const ta=el("textarea",{rows:"8",placeholder:"Category,Shelf,SKU,Qty\nApparel,A-01-01,SKU-1001,10\nCosmetics,A-01-02,SKU-2001,5\nElectronics,A-01-03,SKU-3001,8"});
   const file=el("input",{type:"file",accept:".csv,.tsv,.txt",style:"display:none",onchange(e){
     const f=e.target.files[0];if(!f)return;const r=new FileReader();
     r.onload=()=>{ta.value=String(r.result);pv()};r.readAsText(f)}});
@@ -982,8 +1002,8 @@ function vSetup(host,t){
   ta.addEventListener("input",pv);
 
   const c1=el("div",{class:"card",style:uploadUnlocked?"":"opacity:.62"});
-  c1.append(el("h3",{text:"2 · Upload completed template"}),
-    !uploadUnlocked?el("p",{class:"hint warn",text:"Please download the template first. The upload/paste option will be enabled after the template is downloaded."}):null,
+  c1.append(el("h3",{text:"2 · Upload stock list"}),
+    el("p",{class:"hint",text:"Template download is optional. You can paste data or choose a CSV file directly."}),
     el("label",{class:"f"},el("span",{text:"Paste rows, or load a CSV"}),ta),
     el("div",{class:"row",style:"margin-top:10px"},
       el("button",{class:"btn ghost",onclick:()=>file.click()},"Choose CSV file"),
@@ -995,16 +1015,16 @@ function vSetup(host,t){
         const taskId=makeTaskId();
         const nextCfg=Object.assign({},S.cfg,{taskId,taskStartedAt:now.toISOString(),taskStatus:"OPEN",taskCompletedAt:"",previousTaskId:oldTask,deletedShelves:{},shelfLocks:{}});
         try{
-          if(!SANDBOX&&S.cloud.url&&S.cloud.key){
-            await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:P.rows.map(r=>Object.assign({},r)),cfg:nextCfg,shelfDone:{}}});
-          }
           S.master=P.rows.map(r=>Object.assign({},r));
-          S.lines=[]; S.shelfDone={}; S.cfg=nextCfg;
+          S.lines=[]; S.deletedLineIds=[]; S.shelfDone={}; S.cfg=nextCfg;
           S.activeShelf=null; S.editId=null; rebuildIndexes();
           save("master","lines","state");
-          toast("New audit task created and shared · "+shelves.length+" bins · "+now.toLocaleString("en-IN"),"good");
+          if(CLOUD_ENABLED&&S.cloud.url&&S.cloud.key&&S.cloud.url.indexOf("__CENTRAL_")!==0){
+            await cloudPush(false);
+          }
+          toast((NETWORK_ENABLED?"New audit task created and shared · ":"New audit task created on this device only · ")+shelves.length+" bins · "+now.toLocaleString("en-IN"),"good");
           S.view="scan";render();
-        }catch(e){toast("Task upload failed: "+(e.message||"Please check Google sync"),"err")}
+        }catch(e){toast("Task upload failed: "+(e.message||"Please check central WMS connection"),"err")}
       }},"Create New Audit Task"),file),
     out);
   host.append(c1);
@@ -1092,20 +1112,38 @@ function categoryLabel(c){const x=norm(c);return x?x.charAt(0)+x.slice(1).toLowe
 function isCosmetics(c){return norm(c)==="COSMETICS"}
 function shelfLock(shelf){return (S.cfg.shelfLocks||{})[shelf]||null}
 function myShelfLock(shelf){const x=shelfLock(shelf);return x&&x.by===S.me.id}
-async function claimShelf(shelf){
+function claimShelf(shelf){
   if(S.cfg.taskStatus==="COMPLETE")throw new Error("Audit task is completed. Upload new bins for the next task.");
   const lock=shelfLock(shelf);
   if(lock&&lock.by!==S.me.id)throw new Error("This shelf is already locked by another user");
   if(lock&&lock.by===S.me.id)return true;
-  if(!SANDBOX&&S.cloud.url&&S.cloud.key){
-    try{
-      const j=await cloudCall({key:S.cloud.key,action:"claim",taskId:S.cfg.taskId,shelf:shelf,user:{id:S.me.id,name:S.me.name}});
-      S.cfg.shelfLocks=S.cfg.shelfLocks||{};
-      S.cfg.shelfLocks[shelf]=(j.lock||{by:S.me.id,byName:S.me.name,at:new Date().toISOString()});
-      save("state");return true;
-    }catch(e){toast(e.message,"err");return false}
+
+  // HHT speed: lock locally and open the shelf immediately.
+  // The central server claim runs in the background; if another HHT already
+  // owns the shelf, the server response will release this local lock and
+  // return the user to the shelf list. This removes the network round-trip
+  // from the barcode scan path.
+  S.cfg.shelfLocks=S.cfg.shelfLocks||{};
+  S.cfg.shelfLocks[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString(),pending:true};
+  save("state");
+
+  if(CLOUD_ENABLED&&S.cloud.url&&S.cloud.key){
+    cloudCall({key:S.cloud.key,action:"claim",taskId:S.cfg.taskId,shelf:shelf,user:{id:S.me.id,name:S.me.name}})
+      .then(j=>{
+        S.cfg.shelfLocks=S.cfg.shelfLocks||{};
+        S.cfg.shelfLocks[shelf]=j.lock||{by:S.me.id,byName:S.me.name,at:new Date().toISOString()};
+        S.cloud.err=""; save("state");
+      })
+      .catch(e=>{
+        delete (S.cfg.shelfLocks||{})[shelf];
+        S.cloud.err=e.message; snap();
+        if(S.activeShelf===shelf){
+          S.activeShelf=null; S.editId=null; render();
+          toast("Central bin lock failed: "+e.message,"err");
+        }
+      });
   }
-  S.cfg.shelfLocks=S.cfg.shelfLocks||{};S.cfg.shelfLocks[shelf]={by:S.me.id,byName:S.me.name,at:new Date().toISOString()};save("state");return true;
+  return true;
 }
 function releaseShelfLock(shelf){
   if(!S.cfg.shelfLocks)return;
@@ -1149,7 +1187,7 @@ function vScan(host,t){
     tile("Completed",fmt(t.done),"submitted","g"),
     tile("Scan entries",fmt(t.lines),"across all shelves","b")));
 
-  const jump=el("input",{class:"big",type:"search",placeholder:"Scan shelf barcode…",autocomplete:"off",
+  const jump=el("input",{class:"big",type:"search",inputmode:"none",placeholder:"Scan shelf barcode…",autocomplete:"off",
     onkeydown(e){if(e.key!=="Enter")return;e.preventDefault();
       const v=norm(jump.value);if(!v)return;
       const flat=x=>x.replace(/[^A-Z0-9]/g,"");
@@ -1227,39 +1265,12 @@ function scanShelf(host){
       el("button",{class:"btn ghost",onclick(){
         if(!isAdmin()&&st.sub.by!==S.me.id){toast("Only the submitting user or an admin can reopen","err");return}
         if(!confirm("Reopen "+shelf+" for editing?"))return;
-        delete S.shelfDone[shelf];save("state");toast("Reopened");render()}},"Reopen shelf")));
+        delete S.shelfDone[shelf]; if(S.cfg.shelfLocks)delete S.cfg.shelfLocks[shelf]; save("state");toast("Reopened");render()}},"Reopen shelf")));
   }else{
     host.append(entryRow(shelf,skuIdx));
   }
   host.append(shelfLineTable(shelf,locked));
   host.append(shelfRecon(shelf,st,locked));
-}
-
-function editScanLine(id){
-  const l=S.lines.find(x=>x.id===id);
-  if(!l){toast("Entry not found","err");return}
-  if(S.shelfDone[l.shelf]){toast("Submit ho chuka hai. Reopen shelf first.","err");return}
-  if(!isAdmin() && l.by!==S.me.id){toast("Only your own entry can be edited","err");return}
-  const qty=prompt("Enter physical quantity",String(l.qty));
-  if(qty===null)return;
-  const q=Math.floor(num(qty));
-  if(q<0){toast("Quantity cannot be negative","err");return}
-  const batch=prompt("Batch",l.batch||""); if(batch===null)return;
-  const mfg=prompt("MFG (YYYY-MM-DD)",l.mfg||""); if(mfg===null)return;
-  const exp=prompt("Expiry (YYYY-MM-DD)",l.exp||""); if(exp===null)return;
-  l.qty=q; l.batch=batch.trim(); l.mfg=mfg; l.exp=exp;
-  l.lastBy=S.me.id; l.lastByName=S.me.name; l.ts=new Date().toISOString();
-  if(l.userQty){ l.userQty[l.by||S.me.id]=q; }
-  save("lines"); toast("Entry updated","good"); render();
-}
-function deleteScanLine(id){
-  const l=S.lines.find(x=>x.id===id);
-  if(!l){toast("Entry not found","err");return}
-  if(S.shelfDone[l.shelf]){toast("Submit ho chuka hai. Reopen shelf first.","err");return}
-  if(!isAdmin() && l.by!==S.me.id){toast("Only your own entry can be deleted","err");return}
-  if(!confirm("Delete this scan entry?"))return;
-  S.lines=S.lines.filter(x=>x.id!==id); rebuildIndexes();
-  save("lines"); toast("Entry deleted","good"); render();
 }
 
 function editScanLine(id){
@@ -1285,6 +1296,8 @@ function deleteScanLine(id){
   if(S.shelfDone[l.shelf]){toast("This bin is already submitted","err");return}
   if(!canTouch(l)){toast("You can delete only your own scan entry","err");return}
   if(!confirm("Delete this scan entry for "+l.sku+"?"))return;
+  S.deletedLineIds=S.deletedLineIds||[];
+  if(!S.deletedLineIds.includes(String(l.id)))S.deletedLineIds.push(String(l.id));
   const mine=l.userQty?num(l.userQty[S.me.id]):(l.by===S.me.id?num(l.qty):0);
   if(isAdmin() || mine>=num(l.qty)){
     S.lines=S.lines.filter(x=>x.id!==id);
@@ -1911,70 +1924,58 @@ function csvUsers(){
 }
 /*────── CLOUD SYNC ──────*/
 function vCloud(host){
-  host.append(el("h2",{text:"Google Sheets sync"}));
-  host.append(el("p",{class:"sub",text:"Link this app to the shared Google Apps Script backend. Any user can upload the current bin list, all users see the same bins, and once one user opens a bin it is locked for other users."}));
+  host.append(el("h2",{text:"Central WMS connection"}));
+  host.append(el("p",{class:"sub",text:"This WMS is permanently connected to one central Google Apps Script backend. Users do not need to link a sheet or enter a URL on their HHT."}));
 
-  if(SANDBOX){
+  if(!CLOUD_ENABLED){
     host.append(el("div",{class:"banner w",
-      text:"You are running the copy hosted inside Claude, which is not allowed to call other websites. Put the index.html file on GitHub Pages and open that link — the same settings below will work there."}));
+      text:"Preview / local file mode: central network sync is intentionally disabled here, so no network permission popup should appear. Open the published GitHub Pages WMS link to use live shared data and Google Sheets sync."}));
   }
 
   host.append(el("div",{class:"banner",
-    text:"This app only ever sends data to the sheet — it never reads scan data back. That one-way design is deliberate: pulling data back in was what caused deleted shelves to silently reappear and a fresh Cycle Count to show old shelves as still pending. Each device now stays fully in charge of its own count; the sheet is a real-time mirror for reports, the mailer and the leaderboard, not a second source the app trusts back."}));
+    text:"The Google Apps Script backend is the central source of truth. Every HHT automatically reads the current task and locks from the same backend, while scan changes are merged per user so one device does not overwrite another device's work. A new bin upload replaces the current task for everyone."}));
 
   const c=el("div",{class:"card"});
   c.append(el("h3",{text:"Connection"}));
-  const url=el("input",{value:S.cloud.url,placeholder:"https://script.google.com/macros/s/AKfy…/exec",
-    oninput(e){S.cloud.url=e.target.value.trim();snap()}});
-  const key=el("input",{value:S.cloud.key,placeholder:"the SECRET you set in Code.gs",
-    oninput(e){S.cloud.key=e.target.value.trim();snap()}});
-  const auto=el("select",{onchange(e){S.cloud.auto=e.target.value==="on";snap()}},
-    el("option",{value:"on",selected:S.cloud.auto?"selected":null},"On — push a few seconds after each change"),
-    el("option",{value:"off",selected:!S.cloud.auto?"selected":null},"Off — only when I press Send now"));
-  c.append(el("label",{class:"f"},el("span",{text:"Web app URL (ends in /exec)"}),url),
-    el("label",{class:"f",style:"margin-top:10px"},el("span",{text:"Shared secret"}),key),
-    el("label",{class:"f",style:"margin-top:10px"},el("span",{text:"Automatic sending"}),auto));
+  const configured=CLOUD_ENABLED && !!S.cloud.url && S.cloud.url.indexOf("__CENTRAL_")!==0;
+  c.append(el("div",{class:"banner "+(configured?"":"w"),text:configured?"✓ Central server configured — this device is linked automatically.":(!CLOUD_ENABLED?"Live sync is off in Preview/local mode. Open the published GitHub Pages URL.":"Central server URL/secret are not yet embedded in this WMS build.")}));
   const st=el("p",{class:"hint"});
   c.append(el("div",{class:"row",style:"margin-top:12px"},
-    el("button",{class:"btn ghost",async onclick(){
-      st.className="hint";st.textContent="Testing…";
-      try{const j=await cloudPing();st.className="hint ok";
-        st.textContent="Connected — spreadsheet: "+(j.sheet||"linked");render()}
-      catch(e){st.className="hint bad";st.textContent=e.message}}},"Test connection"),
-    el("button",{class:"btn hv",async onclick(){
-      st.className="hint";st.textContent="Sending…";
-      try{await cloudPush(false)}catch(e){st.className="hint bad";st.textContent=e.message}}},"Send now")),st);
-  if(S.cloud.err) c.append(el("p",{class:"hint bad",text:"Last error: "+S.cloud.err}));
+    el("button",{class:"btn ghost",disabled:!CLOUD_ENABLED,async onclick(){st.textContent="Testing…";try{const j=await cloudPing();st.className="hint ok";st.textContent="Connected — "+(j.sheet||"central WMS");render()}catch(e){st.className="hint bad";st.textContent=e.message}}},"Test central connection"),
+    el("button",{class:"btn hv",disabled:!CLOUD_ENABLED,async onclick(){st.textContent="Sending…";try{await cloudPush(false)}catch(e){st.className="hint bad";st.textContent=e.message}}},"Save current data now")),st);
   host.append(c);
 
   host.append(el("div",{class:"tiles"},
-    tile("Link status",S.cloud.url?(S.cloud.err?"Error":"Linked"):"Not set",
-      S.cloud.url?"web app configured":"paste the /exec URL",S.cloud.err?"r":S.cloud.url?"g":""),
+    tile("Link status",!CLOUD_ENABLED?"Preview · offline":S.cloud.url?(S.cloud.err?"Error":"Linked"):"Not set",
+      !CLOUD_ENABLED?"open published WMS URL":S.cloud.url?"web app configured":"paste the /exec URL",S.cloud.err?"r":S.cloud.url?"g":""),
     tile("Last sent",S.cloud.lastPush?tstamp(S.cloud.lastPush):"—","scan data to Sheets","b"),
-    tile("Auto send",S.cloud.auto?"On":"Off",S.cloud.auto?"a few seconds after each change":"manual only",
-      S.cloud.auto?"g":"y")));
+    tile("Auto send",!CLOUD_ENABLED?"Off in Preview":S.cloud.auto?"On":"Off",!CLOUD_ENABLED?"published URL only":S.cloud.auto?"a few seconds after each change":"manual only",
+      CLOUD_ENABLED&&S.cloud.auto?"g":"y")));
 
   host.append(el("div",{class:"card"},el("h3",{text:"What lands in the spreadsheet"}),
-    el("p",{class:"sub",style:"margin-bottom:8px",text:"Each push merges into the sheet (it never removes another device's work) and rebuilds six tabs so your charts and pivots keep pointing at the same cells:"}),
+    el("p",{class:"sub",style:"margin-bottom:8px",text:"Each push is saved centrally and the backend rebuilds the reporting tabs so all users and reports work from the same current task:"}),
     el("ul",{style:"margin:0;padding-left:20px;color:var(--ink-2)"},
       el("li",{text:"Scan Data — every entry with shelf life, current life % and days, and the user who scanned it"}),
       el("li",{text:"Bin Summary — shelf-wise system vs physical and who submitted it"}),
       el("li",{text:"SKU Summary — SKU-wise totals across the warehouse"}),
       el("li",{text:"Shelf Life — the four brackets plus the SKU split inside each"}),
       el("li",{text:"Users — per-user entries, quantity and shelves submitted"}),
-      el("li",{text:"CC History — every closed Cycle Count with its totals"})),
+      el("li",{text:"Task History — the current audit task and its totals"})),
     el("p",{class:"hint",text:"A seventh tab, Mail List, is where you put the email IDs that get the scheduled report."})));
 
   host.append(el("div",{class:"card"},el("h3",{text:"Using more than one phone"}),
     el("p",{class:"sub",style:"margin-bottom:0",
-      text:"Set up each phone the same way: link the same Web app URL and secret, upload the master stock list, and create each operator's login on that phone. Every phone then pushes its own scans to the same sheet, and the sheet's reports combine everyone's work — but no phone ever reads another phone's data back, so one person's deletes, edits, or a fresh Cycle Count can never silently change what another person sees on their screen."})));
+      text:"All HHTs use the same central backend automatically. One user uploads the bin list and the new task appears on every device. When one user opens a bin, the server locks it for everyone else. Scans, edits, deletions, submissions and task completion are saved centrally."})));
 
-  host.append(el("details",{class:"help"},el("summary",{text:"Setup in short"}),
-    el("p",{html:"1. New Google Sheet → Extensions → Apps Script → paste <code>Code.gs</code> → set your own <code>SECRET</code>."}),
-    el("p",{html:"2. Deploy → New deployment → Web app → Execute as <b>Me</b>, Access <b>Anyone</b> → copy the <code>/exec</code> URL into the box above."}),
-    el("p",{html:"3. Put <code>index.html</code> in a GitHub repo → Settings → Pages → Deploy from branch → <code>main</code> / root. Your link becomes <code>https://&lt;user&gt;.github.io/&lt;repo&gt;/</code>."}),
-    el("p",{html:"4. In the sheet's <b>Mail List</b> tab add the email IDs, then run <code>installDailyTrigger</code> once to schedule the mail."}),
-    el("p",{text:"The full walkthrough is in SETUP-GUIDE.md alongside the files."})));
+  const setup=el("div",{class:"card"});
+  setup.append(el("h3",{text:"One-time admin setup"}));
+  setup.append(el("p",{class:"sub",text:"Only the WMS owner needs to deploy the Google Apps Script backend once. After the central URL and secret are embedded in this file, operators never need to link Google Sheets."}));
+  setup.append(el("ol",{style:"margin:0;padding-left:20px;color:var(--ink-2)"},
+    el("li",{text:"Deploy the supplied Code.gs as a Google Apps Script Web App (Execute as Me, access Anyone)."}),
+    el("li",{text:"The /exec URL and shared secret are already embedded in this final WMS build. If you create a new Apps Script deployment, update CENTRAL_API_URL once in the owner copy before publishing."}),
+    el("li",{text:"Publish this HTML on GitHub Pages. Every user opens the same link."})
+  ));
+  host.append(setup);
 }
 
 function vUsers(host){
