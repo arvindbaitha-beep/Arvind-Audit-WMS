@@ -380,6 +380,9 @@ const sgn=n=>(n>0?"+":"")+fmt(n);
 const norm=s=>String(s==null?"":s).trim().toUpperCase();
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 const initials=n=>String(n||"?").trim().split(/\s+/).slice(0,2).map(w=>w[0]).join("").toUpperCase();
+/* Local date-time for reports: 2026-10-02 15:21:27 (device time zone). ISO "Z" strings are UTC and showed 5h30m behind in IST. */
+const lts=s=>{if(!s)return"";const d=new Date(s);if(isNaN(d))return String(s);const p=n=>String(n).padStart(2,"0");
+  return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds())};
 const tstamp=s=>{try{return new Date(s).toLocaleString("en-IN",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})}catch(e){return""}};
 let tT;function toast(m,k){clearTimeout(tT);let t=$("#toast");if(!t){t=el("div",{id:"toast"});document.body.append(t)}
   t.className="toast "+(k||"");t.textContent=m;tT=setTimeout(()=>t.remove(),k==="err"?3600:1900)}
@@ -2048,7 +2051,7 @@ function csvScans(){
   const rows=userVisibleLines();
   const g=hdr().concat([["Category","Shelf","SKU","Description","Batch","MFG","Expiry","Shelf Life (months)","Current Shelf Life %","Current Shelf Life (days)","Bracket","Qty Scanned","System Qty (shelf+SKU)","Scanned By","Scanned At","Shelf Status"]]);
   rows.forEach(l=>{const L=life(l.mfg,l.exp),sys=systemSkuQty(l.shelf,l.sku),d=(S.master.filter(r=>r.sku===l.sku&&r.desc)[0]||{}).desc||"";
-    g.push([categoryLabel(l.category||shelfCategory(l.shelf)),l.shelf,l.sku,d,l.batch||"",l.mfg||"",l.exp||"",L?L.totalMonths.toFixed(2):"",L?L.pct.toFixed(2):"",L?L.remDays:"",L?(L.expired?"Expired":L.bracket.label):"No dates",l.qty,sys,l.byName||l.lastByName||"",l.ts,isAdmin()&&S.shelfDone[l.shelf]?"Completed":S.shelfDone[l.shelf]&&S.shelfDone[l.shelf].by===S.me.id?"Completed":"Open"])});
+    g.push([categoryLabel(l.category||shelfCategory(l.shelf)),l.shelf,l.sku,d,l.batch||"",l.mfg||"",l.exp||"",L?L.totalMonths.toFixed(2):"",L?L.pct.toFixed(2):"",L?L.remDays:"",L?(L.expired?"Expired":L.bracket.label):"No dates",l.qty,sys,l.byName||l.lastByName||"",lts(l.ts),isAdmin()&&S.shelfDone[l.shelf]?"Completed":S.shelfDone[l.shelf]&&S.shelfDone[l.shelf].by===S.me.id?"Completed":"Open"])});
   return g;
 }
 function csvBins(){
@@ -2058,7 +2061,7 @@ function csvBins(){
   t.stats.forEach(s=>g.push([categoryLabel(shelfCategory(s.shelf)),s.shelf,s.skuTotal,s.skuCounted,s.extraSku,s.sysQty,s.lines?s.cntQty:"",
     s.lines?s.diff:"",s.sysQty?(s.diff/s.sysQty*100).toFixed(2):"",s.lines,
     s.state==="done"?"Completed":s.state==="part"?"In progress":"Pending",
-    s.sub?s.sub.byName:"",s.sub?s.sub.at:""]));
+    s.sub?s.sub.byName:"",s.sub?lts(s.sub.at):""]));
   g.push([]);
   g.push(["TOTAL","","","",t.sysQty,t.cntQty,t.diff,
     t.sysQty?(t.diff/t.sysQty*100).toFixed(2):"",t.lines,"Accuracy "+t.accuracy.toFixed(2)+"%"]);
@@ -2108,7 +2111,7 @@ function csvUsers(){
   const users=isAdmin()?S.users:S.users.filter(u=>u.id===S.me.id),m=new Map();
   lines.forEach(l=>{const k=l.byName||l.lastByName||"—";const e=m.get(k)||{n:0,q:0,sh:new Set(),sk:new Set(),first:l.ts,last:l.ts};e.n++;e.q+=l.qty;e.sh.add(l.shelf);e.sk.add(l.sku);if(l.ts<e.first)e.first=l.ts;if(l.ts>e.last)e.last=l.ts;m.set(k,e)});
   const g=hdr().concat([["User","Role","Entries","Qty Scanned","SKU Touched","Shelves Touched","Shelves Submitted","First Scan","Last Scan"]]);
-  users.forEach(u=>{const e=m.get(u.name)||{n:0,q:0,sh:new Set(),sk:new Set(),first:"",last:""};const submitted=Object.keys(S.shelfDone).filter(s=>S.shelfDone[s].by===u.id);g.push([u.name,u.role,e.n,e.q,e.sk.size,e.sh.size,submitted.length,e.first,e.last])});return g;
+  users.forEach(u=>{const e=m.get(u.name)||{n:0,q:0,sh:new Set(),sk:new Set(),first:"",last:""};const submitted=Object.keys(S.shelfDone).filter(s=>S.shelfDone[s].by===u.id);g.push([u.name,u.role,e.n,e.q,e.sk.size,e.sh.size,submitted.length,lts(e.first),lts(e.last)])});return g;
 }
 /*────── CLOUD SYNC ──────*/
 function vCloud(host){
