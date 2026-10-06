@@ -339,7 +339,7 @@ input,select,textarea{background:#fff;border:1px solid #ccd9e6;border-radius:8px
   P[m]=function(...a){return o.apply(this,a.filter(x=>x!=null&&x!==false))}}}})();
 const APP="Stock Audit WMS", LS="wms.sc.v3", LS_OLD="wms.sc.v2";
 /* Paste your Apps Script /exec URL once here and every phone/PC opens already linked. */
-const DEFAULT_CLOUD={url:"",key:"ARVIND_WMS_2026"};
+const DEFAULT_CLOUD={url:"https://script.google.com/macros/s/AKfycbydpz7mbrqagxUFpW5S-o88RdnIcmsKqoH5z6525RW4aWEHNSh-6lXwvZxx_sHCc_fw/exec",key:"ARVIND_WMS_2026"};
 const BRACKETS=[
   {k:"b60",label:"Above 60%",min:60,max:Infinity,cls:"ok",   note:"Fresh stock"},
   {k:"b40",label:"40% to 60%",min:40,max:60,     cls:"info", note:"Normal rotation"},
@@ -723,6 +723,7 @@ function chip(m){const c=$("#chip");if(!c)return;
 
 async function boot(){
   const meId=await loadLocal();
+  const linkedNow=!SANDBOX&&applyTeamLink();
   try{DB=window.claude&&claude.use?await claude.use("db"):null}catch(e){DB=null}
   try{DL=window.claude&&claude.use?await claude.use("downloads"):null}catch(e){DL=null}
   if(DB){
@@ -754,6 +755,7 @@ async function boot(){
   if(meId) S.me=S.users.find(u=>u.id===meId)||null;
   ensureTask();
   S.booted=true; render();
+  if(linkedNow)toast("This device is now linked to the team Google Sheet","good");
 }
 
 async function hash(pw){
@@ -886,7 +888,7 @@ function gate(){
       const cu=el("input",{type:"text",placeholder:"https://script.google.com/macros/s/…/exec",value:S.cloud.url,autocapitalize:"off"});
       const ck=el("input",{type:"text",placeholder:"shared secret",value:S.cloud.key,autocapitalize:"off"});
       const cerr=el("p",{class:"hint bad"});
-      c.append(el("details",{class:"help",style:"margin-top:14px"},el("summary",{text:"Team already set up? Connect this device to the Google Sheet"}),
+      c.append(el("details",{class:"help",style:"margin-top:14px",open:cloudReady()?null:""},el("summary",{text:"Team already set up? Connect this device to the Google Sheet"}),
         el("label",{class:"f",style:"margin-top:8px"},el("span",{text:"Web app URL"}),cu),
         el("label",{class:"f",style:"margin-top:8px"},el("span",{text:"Shared secret"}),ck),cerr,
         el("button",{class:"btn ghost block",style:"margin-top:10px",async onclick(){
@@ -1050,7 +1052,7 @@ function vDash(host,t){
   const reports=el("div",{class:"card"});reports.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Quick Report Downloads"}),el("button",{class:"btn ghost sm",onclick(){S.view="export";render()}},"View All →")));
   const rl=el("div",{class:"report-list"});[["Scan Data","csvScans","SCAN-DATA.csv"],["Bin Summary","csvBins","BIN-SUMMARY.csv"],["SKU Summary","csvSkus","SKU-SUMMARY.csv"],["Shelf Life","csvBrackets","SHELF-LIFE.csv"],["Final Report","csvFullReport","FINAL-REPORT.csv"]].forEach(([label,fn,file])=>rl.append(el("div",{class:"report-row"},el("span",{class:"report-name",text:label}),el("button",{class:"btn hv",onclick(){if(typeof window[fn]==="function")download(file,toCsv(window[fn]()))}},"Download"))));reports.append(rl);
 
-  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"Task ID: ",el("b",{text:S.cfg.taskId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:S.cloud.url&&!S.cloud.err?"Synced":"Local / Not linked"})),el("div",{class:"sync-ok",style:"margin-top:8px"},S.cloud.url&&!S.cloud.err?"Data synced across devices":"Ready for Google Sheet sync")));
+  const sys=el("div",{class:"card"});sys.append(el("h3",{text:"System Information"}));sys.append(el("div",{style:"font-size:12px;line-height:2"},el("div",{},"Total Users: ",el("b",{text:fmt(S.users.length)})),el("div",{},"Active User: ",el("b",{text:S.me.name})),el("div",{},"Task ID: ",el("b",{text:S.cfg.taskId||"—"})),el("div",{},"My Scanned Qty: ",el("b",{text:fmt(myQty)})),el("div",{},"Cloud: ",el("b",{text:!cloudReady()?"Local / Not linked":(S.cloud.err?"Sync problem":"Synced")})),el("div",{class:cloudReady()&&!S.cloud.err?"sync-ok":"banner w",style:"margin-top:8px"},!cloudReady()?"This device is not linked yet. Open the Team link shared by your admin (or Cloud Sync → paste the URL once).":(S.cloud.err?S.cloud.err:"Data synced across all devices")),isAdmin()&&cloudReady()?el("button",{class:"btn ghost sm block",style:"margin-top:10px",onclick(){shareTeamLink()}},"Share team link"):null));
 
   const team=el("div",{class:"card"});
   team.append(el("div",{class:"row",style:"justify-content:space-between"},el("h3",{text:"Team Progress (User-wise)"}),
@@ -1270,6 +1272,25 @@ function categoryLabel(c){const x=norm(c);return x?x.charAt(0)+x.slice(1).toLowe
 function isCosmetics(c){return norm(c)==="COSMETICS"}
 function shelfLock(shelf){return (S.cfg.shelfLocks||{})[shelf]||null}
 function myShelfLock(shelf){const x=shelfLock(shelf);return x&&x.by===S.me.id}
+/* Team link = this page + the Web-app URL and secret in the #hash. Opening it links that device automatically. */
+async function shareTeamLink(){
+  const l=teamLink();
+  try{await navigator.clipboard.writeText(l);toast("Team link copied — send it to your users (WhatsApp etc.)","good")}
+  catch(e){prompt("Copy this Team link and send it to your users:",l)}
+}
+function teamLink(){
+  const o={u:String(S.cloud.url||"").trim(),k:String(S.cloud.key||"").trim()};
+  return location.origin+location.pathname+"#wms="+btoa(unescape(encodeURIComponent(JSON.stringify(o))));
+}
+function applyTeamLink(){
+  try{
+    const m=/[#&]wms=([^&]+)/.exec(location.hash||"");if(!m)return false;
+    const o=JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(m[1])))));
+    history.replaceState(null,"",location.pathname+location.search);
+    if(!o||!/^https:\/\/script\.google(usercontent)?\.com\//.test(o.u||"")||!o.k)return false;
+    S.cloud.url=o.u;S.cloud.key=o.k;S.cloud.err="";snap();return true;
+  }catch(e){return false}
+}
 const lockStale=l=>{const t=Date.parse(l&&l.at);return isFinite(t)&&Date.now()-t>12*3600*1000};
 async function claimShelf(shelf){
   if(S.cfg.taskStatus==="COMPLETE"){toast("Audit task is completed. Upload new bins for the next task.","err");return false}
@@ -2174,6 +2195,15 @@ function vCloud(host){
       el("li",{text:"CC History — every closed Cycle Count with its totals"})),
     el("p",{class:"hint",text:"A seventh tab, Mail List, is where you put the email IDs that get the scheduled report."})));
 
+  if(cloudReady()){
+    const tl=el("input",{value:teamLink(),readonly:"readonly",onclick(e){e.target.select()}});
+    host.append(el("div",{class:"card"},el("h3",{text:"Team link — link every device in one step"}),
+      el("p",{class:"sub",text:"Link this admin device once, then send the Team link below to everyone. Opening it links that phone/PC to the same Google Sheet automatically; they only sign in with their own username. Anyone holding the link can reach the Sheet, so share it only with your team."}),
+      tl,
+      el("div",{class:"row",style:"margin-top:10px;gap:8px;flex-wrap:wrap"},
+        el("button",{class:"btn hv",onclick(){shareTeamLink()}},"Copy team link"),
+        el("a",{class:"btn ghost",target:"_blank",rel:"noopener",href:"https://wa.me/?text="+encodeURIComponent("Stock Audit WMS - open this link and sign in with your username:\n"+teamLink())},"Send on WhatsApp"))));
+  }
   host.append(el("div",{class:"card"},el("h3",{text:"Using more than one phone / PC"}),
     el("p",{class:"sub",style:"margin-bottom:0",
       text:"Open the same link on every device and connect it to the same Web app URL + secret. Users, the uploaded stock list, shelf locks, submitted bins and every scan are shared automatically: each device sends only its own changes and receives the others' changes every few seconds. One shelf can be open for one user at a time (locked while scanning, released when submitted). Scanning keeps working without internet — unsent scans stay safely on the device and sync as soon as the connection returns."})));
