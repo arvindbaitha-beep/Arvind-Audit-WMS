@@ -561,7 +561,7 @@ const emptyPending=()=>({taskId:S.cfg.taskId||"",since:S.sync.rev,mver:S.sync.mv
 const hasPending=p=>!!(p.lines.length||p.deletedIds.length||Object.keys(p.doneOps).length||p.usersUp.length||p.usersDel.length||p.cfgPatch);
 const pendingCount=()=>{const p=pendingInfo();return p.lines.length+p.deletedIds.length+Object.keys(p.doneOps).length+p.usersUp.length+p.usersDel.length+(p.cfgPatch?1:0)};
 
-async function cloudCall(body,qs,timeoutMs){
+var cloudCall=async function cloudCall(body,qs,timeoutMs){
   if(SANDBOX) throw new Error("Blocked inside Claude — run the GitHub Pages copy for this");
   const url=String(S.cloud.url||"").trim();
   if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url))
@@ -575,13 +575,51 @@ async function cloudCall(body,qs,timeoutMs){
   }catch(e){const x=new Error(e&&e.name==="AbortError"?"Google is slow to respond — will retry":"No internet or Google unreachable — will retry");x.network=true;throw x}
   finally{if(to)clearTimeout(to)}
   const txt=await res.text();
-  let j;try{j=JSON.parse(txt)}catch(e){throw new Error("Apps Script replied with a page, not JSON. Re-deploy as a NEW VERSION with access set to Anyone.")}
+  let j;try{j=JSON.parse(txt)}catch(e){throw pageError(txt,res.status)}
   if(!j.ok)throw new Error(j.error||"Apps Script refused the request");
   return j;
+};
+/* Google answered with an HTML page: tell the user which problem it really is. */
+function pageError(html,status){
+  const t=String(html||"").replace(/<script[\s\S]*?<\/script>/gi," ").replace(/<style[\s\S]*?<\/style>/gi," ").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+  const low=t.toLowerCase();let why,transient=false;
+  if(/exceeded maximum execution time|maximum execution time/.test(low)){why="Google script timed out (too much data in one call) — press Sync now again; if it repeats, use Re-send all data";transient=true}
+  else if(/sign in|accounts\.google|choose an account|authorization required|authorisation required|needs access/.test(low)){why="Web app access is not 'Anyone' (or authorization pending). Apps Script → Deploy → Manage deployments → Edit → Who has access: Anyone → New version → Deploy"}
+  else if(/unable to open the file|file not found|no longer available|sorry/.test(low)){why="Google could not open this web app right now (busy, or the deployment was replaced). Retrying automatically; if it stays, re-check the /exec URL";transient=true}
+  else if(/service invoked too many times|too many|quota|rate limit/.test(low)){why="Google daily/short-term quota reached — wait a few minutes";transient=true}
+  else if(/typeerror|referenceerror|syntaxerror/.test(low)){why="Script error in Code.gs: "+t.slice(0,140)}
+  else why="Google sent a page instead of data"+(status?" (HTTP "+status+")":"")+": "+t.slice(0,140);
+  const e=new Error(why);e.page=true;e.transient=transient;return e;
 }
+const sleepMs=ms=>new Promise(r=>setTimeout(r,ms));
+/* every Google call is retried once on a transient Google page */
+const _cloudCall0=cloudCall;
+cloudCall=async function(body,qs,timeoutMs){
+  try{return await _cloudCall0(body,qs,timeoutMs)}
+  catch(e){
+    if(e&&e.page&&e.transient&&body&&(body.action==="sync"||body.action==="master"||body.action==="ping")){await sleepMs(1500);return await _cloudCall0(body,qs,timeoutMs)}
+    throw e}
+};
 async function cloudPing(){
   const j=await cloudCall(null,"action=ping&key="+encodeURIComponent(S.cloud.key));
   S.cloud.err="";return j;
+}
+/* master rows travel as [shelf,sku,desc,category,qty,uom] - about 3x smaller than objects */
+const packMaster=rows=>rows.map(r=>[r.shelf,r.sku,r.desc||"",r.category||"",r.qty,r.uom||""]);
+const unpackMaster=a=>({shelf:a[0],sku:a[1],desc:a[2],category:a[3],qty:a[4],uom:a[5]});
+async function fetchMaster(expectMver){
+  const out=[];let off=0,total=1,mver=expectMver||"";
+  while(off<total){
+    const j=await cloudCall({key:S.cloud.key,action:"master",offset:off,limit:4000},null,60000);
+    const d=j.data;
+    if(mver&&d.mver&&d.mver!==mver)throw Object.assign(new Error("Task changed while loading — retrying"),{transient:true,restart:true});
+    mver=d.mver||mver;total=d.total;
+    for(const a of d.rows)out.push(unpackMaster(a));
+    off+=d.rows.length;
+    cloudChip("Loading stock list "+Math.min(off,total)+" / "+total);
+    if(!d.rows.length)break;
+  }
+  return out;
 }
 function wipeLocalTask(){
   S.master=[];S.lines=[];S.shelfDone={};S.activeShelf=null;S.editId=null;
@@ -646,7 +684,7 @@ function applyServer(d,p,x){
 }
 /* Server is empty but this device holds a task (first link / upgrade) — move it to the Sheet. */
 async function migrateToCloud(){
-  const j=await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:S.master,cfg:Object.assign({},S.cfg),shelfDone:S.shelfDone},users:S.users},null,120000);
+  const j=await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:packMaster(S.master),cfg:Object.assign({},S.cfg),shelfDone:S.shelfDone},users:S.users},null,240000);
   S.lines.forEach(l=>S.sync.dirtyIds.add(String(l.id)));
   S.sync.doneSnap={};S.sync.rev=0;S.sync.mver=(j.data||{}).mver||"";
   toast("Existing data uploaded to Google Sheet","good");
@@ -663,8 +701,12 @@ async function syncOnce(o){
   const x={usersSig:JSON.stringify(S.users),doneSig:JSON.stringify(S.shelfDone),cfgSigSent:settingsSig()};
   let ok=false,changed=false,err="";
   try{
-    const j=await cloudCall(Object.assign({key:S.cloud.key,action:"sync"},p),null,o.timeout);
+    const j=await cloudCall(Object.assign({key:S.cloud.key,action:"sync"},p),null,o.timeout||45000);
     const d=j.data||{};
+    if(d.needMaster){
+      let tries=0;
+      for(;;){try{d.master=await fetchMaster(d.mver);break}catch(e){if(e&&e.restart&&tries++<2)continue;throw e}}
+    }
     changed=applyServer(d,p,x);
     if(d.serverEmpty&&!S.cloud.migrated&&S.master.length){await migrateToCloud();queuePush(200)}
     S.cloud.migrated=true;
@@ -689,7 +731,7 @@ async function syncOnce(o){
 function startCloudPolling(){
   clearInterval(pullT);
   if(!cloudReady())return;
-  pullT=setInterval(()=>{if(document.hidden||syncing||!S.me)return;syncOnce({silent:true,pullOnly:!S.cloud.auto}).catch(()=>{})},5000);
+  pullT=setInterval(()=>{if(document.hidden||syncing||!S.me)return;syncOnce({silent:true,pullOnly:!S.cloud.auto}).catch(()=>{})},7000);
 }
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&S.booted&&cloudReady()&&S.me)syncOnce({silent:true}).catch(()=>{})});
 window.addEventListener("online",()=>{if(S.booted&&cloudReady())syncOnce({silent:true}).catch(()=>{})});
@@ -1158,7 +1200,7 @@ function vSetup(host,t){
       const nextCfg=Object.assign({},S.cfg,{taskId,taskStartedAt:now.toISOString(),taskStatus:"OPEN",taskCompletedAt:"",previousTaskId:oldTask,deletedShelves:{},shelfLocks:{}});
       let shared=false;
       if(cloudReady()){
-        const j=await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:rows,cfg:nextCfg,shelfDone:{}},users:S.users},null,120000);
+        const j=await cloudCall({key:S.cloud.key,action:"uploadTask",task:{master:packMaster(rows),cfg:nextCfg,shelfDone:{}},users:S.users},null,240000);
         const d=j.data||{};
         S.sync.rev=d.rev||0;S.sync.mver=d.mver||"";S.sync.dirtyIds.clear();S.sync.deletedIds.clear();S.sync.doneSnap={};S.sync.cfgSnap=settingsSig();
         S.cloud.migrated=true;shared=true;
